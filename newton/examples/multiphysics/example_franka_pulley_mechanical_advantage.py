@@ -1,0 +1,1217 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 The Newton Developers
+# SPDX-License-Identifier: Apache-2.0
+
+###########################################################################
+# Example Franka Pulley Mechanical Advantage
+#
+# A MuJoCo-simulated Franka follows an IK trajectory that pulls the free end
+# of a VBD cable. Two moving and two fixed VBD pulleys form a 4:1 block and
+# tackle that lifts a 5 kg guided weight. The hand approaches and closes on
+# a thin box attached directly to the cable end, and SolverCoupledProxy transfers
+# soft-contact force between the MuJoCo gripper and the VBD mechanism without
+# a fixed robot-cable attachment.
+#
+# The cable is initialized as a straight rod and its body transforms are then
+# placed on an explicitly pre-wrapped route, following the initialization used
+# by cable_cross_slide_table. The final validation measures cable tension from
+# the axial strain along a straight span clear of pulley contacts and checks
+# both the expected force ratio and the inverse 4:1 travel ratio from the
+# actual grasped-box and load motion.
+#
+# Command: python -m newton.examples franka_pulley_mechanical_advantage
+#
+###########################################################################
+
+from __future__ import annotations
+
+import math
+from collections.abc import Callable
+
+import numpy as np
+import warp as wp
+from newton.solvers.experimental.coupled import SolverCoupled, SolverCoupledProxy
+
+import newton
+import newton.examples
+import newton.ik as ik
+import newton.utils
+from newton.solvers import SolverMuJoCo, SolverVBD
+
+MECHANICAL_ADVANTAGE = 4.0
+WEIGHT_MASS = 8.0
+END_WEIGHT_MASS = 0.1
+LOAD_WEIGHT_MASS = WEIGHT_MASS + END_WEIGHT_MASS * MECHANICAL_ADVANTAGE
+GRAVITY = 9.81
+FRANKA_BASE_X = 1.18
+
+CABLE_RADIUS = 0.004
+CABLE_SEGMENT_LENGTH = 0.020
+CABLE_STRETCH_STIFFNESS = 1.0e5
+CABLE_STRETCH_DAMPING = 1.0e-4
+CABLE_BEND_STIFFNESS = 1.0e-2
+CABLE_BEND_DAMPING = 5.0e-5
+CABLE_PULLEY_FRICTION = 0.1
+CABLE_CONTACT_GAP = 0.5 * CABLE_RADIUS
+END_WEIGHT_INITIAL_OFFSET = 0.020
+END_BOX_HALF_X = 0.025
+END_BOX_HALF_Y = 0.008
+END_BOX_HALF_Z = 0.050
+GRIPPER_FRICTION = 8.0
+GRIPPER_CONTACT_STIFFNESS = 2.0e4
+GRIPPER_CONTACT_DAMPING = 50.0
+GRIPPER_PAD_HALF_X = 0.010
+GRIPPER_PAD_HALF_Y = 0.004
+GRIPPER_PAD_HALF_Z = 0.012
+GRIPPER_PAD_CENTER_Y = GRIPPER_PAD_HALF_Y
+GRIPPER_PAD_CENTER_Z = 0.055
+CABLE_PLANE_STIFFNESS = 20.0
+CABLE_PLANE_DAMPING = 0.12
+
+PULLEY_RADIUS = 0.045
+PULLEY_WRAP_CLEARANCE = 1.1 * CABLE_RADIUS
+PULLEY_WRAP_RADIUS = PULLEY_RADIUS + PULLEY_WRAP_CLEARANCE
+PULLEY_FIXED_Z = 1.10
+PULLEY_MOVING_Z = 0.72
+PULL_X = 0.55
+PULLEY_PAIR_COUNT = int(MECHANICAL_ADVANTAGE / 2.0)
+PULLEY_MOVING_X = tuple(
+    PULL_X - (4.0 * (PULLEY_PAIR_COUNT - index) - 1.0) * PULLEY_WRAP_RADIUS for index in range(PULLEY_PAIR_COUNT)
+)
+PULLEY_FIXED_X = tuple(x + 2.0 * PULLEY_WRAP_RADIUS for x in PULLEY_MOVING_X)
+
+PULL_START_Z = 0.48
+PULL_DISTANCE = 0.22
+GRIPPER_APPROACH_ANGLE = math.pi / 6.0
+GRASP_TCP_X = 0.555
+GRASP_TCP_Z = 0.437
+PULL_END_Z = GRASP_TCP_Z - PULL_DISTANCE
+PULL_Y = 0.0
+GRIPPER_TARGET_Y = 0.0
+
+INITIAL_HOLD_DURATION = 0.0
+APPROACH_DURATION = 1.2
+SIDE_APPROACH_DURATION = 0.8
+PREGRASP_HOLD_DURATION = 1.6
+GRASP_DURATION = 1.0
+PULL_DURATION = 8.0
+FINAL_HOLD_DURATION = 2.0
+GRASP_END_TIME = (
+    INITIAL_HOLD_DURATION + APPROACH_DURATION + SIDE_APPROACH_DURATION + PREGRASP_HOLD_DURATION + GRASP_DURATION
+)
+PULL_END_TIME = GRASP_END_TIME + PULL_DURATION
+EXAMPLE_DURATION = PULL_END_TIME + FINAL_HOLD_DURATION
+TRAVEL_REFERENCE_LIFT_EPSILON = 5.0e-4
+
+GRIPPER_APPROACH_ORIENTATION = (
+    0.0,
+    -math.cos(GRIPPER_APPROACH_ANGLE),
+    0.0,
+    math.sin(GRIPPER_APPROACH_ANGLE),
+)
+GRIP_OPEN = 0.040
+GRIP_CLOSE = 0.007
+
+# Raised-arm starting point for the IK solve (7 arm + 2 finger coordinates).
+FRANKA_Q = [
+    0.0,
+    -0.569,
+    0.0,
+    -2.810,
+    0.0,
+    3.037,
+    0.741,
+    GRIP_OPEN,
+    GRIP_OPEN,
+]
+
+
+@wp.kernel
+def set_task_target(
+    target_positions: wp.array[wp.vec3],
+    target_rotations: wp.array[wp.vec4],
+    finger_position: wp.array[float],
+    position: wp.vec3,
+    rotation: wp.vec4,
+    grip_width: float,
+):
+    """Set the single-world IK target without reallocating device arrays."""
+    target_positions[0] = position
+    target_rotations[0] = rotation
+    finger_position[0] = grip_width
+
+
+@wp.kernel
+def set_gripper_target(joint_q: wp.array2d[float], finger_position: wp.array[float], index_0: int, index_1: int):
+    """Set both Franka finger coordinates to the commanded half-width."""
+    joint_q[0, index_0] = finger_position[0]
+    joint_q[0, index_1] = finger_position[0]
+
+
+@wp.kernel
+def set_body_xforms(
+    body_indices: wp.array[wp.int32],
+    body_xforms: wp.array[wp.transform],
+    body_q0: wp.array[wp.transform],
+    body_q1: wp.array[wp.transform],
+):
+    """Place the straight-rest cable onto its pre-wrapped initial route."""
+    tid = wp.tid()
+    body = body_indices[tid]
+    xform = body_xforms[tid]
+    body_q0[body] = xform
+    body_q1[body] = xform
+
+
+def _capture_frame_graph(model: newton.Model, simulate: Callable[[], None], *, enabled: bool):
+    if not enabled or not model.device.is_cuda:
+        return None
+
+    with wp.ScopedDevice(model.device), wp.ScopedCapture() as capture:
+        simulate()
+    return capture.graph
+
+
+def _launch_frame_graph(model: newton.Model, graph) -> bool:
+    if graph is None:
+        return False
+
+    with wp.ScopedDevice(model.device):
+        wp.capture_launch(graph)
+    return True
+
+
+def _find_label_index(labels: list[str], suffix: str) -> int:
+    for index, label in enumerate(labels):
+        if label.endswith(suffix):
+            return index
+    raise ValueError(f"Could not find label ending in {suffix!r}")
+
+
+def _append_route_point(points: list[wp.vec3], point: wp.vec3) -> None:
+    if not points or float(wp.length(point - points[-1])) > 1.0e-8:
+        points.append(point)
+
+
+def _append_arc_xz(
+    points: list[wp.vec3],
+    center: wp.vec3,
+    radius: float,
+    start_angle: float,
+    end_angle: float,
+    segment_length: float,
+    *,
+    direction: str,
+) -> None:
+    """Append a pulley arc in the vertical XZ plane."""
+    delta = (end_angle - start_angle + math.pi) % (2.0 * math.pi) - math.pi
+    if direction == "cw" and delta > 0.0:
+        delta -= 2.0 * math.pi
+    elif direction == "ccw" and delta < 0.0:
+        delta += 2.0 * math.pi
+
+    count = max(3, int(math.ceil(abs(delta) * radius / segment_length)))
+    for i in range(count + 1):
+        angle = start_angle + delta * float(i) / float(count)
+        _append_route_point(
+            points,
+            wp.vec3(
+                float(center[0]) + radius * math.cos(angle),
+                float(center[1]),
+                float(center[2]) + radius * math.sin(angle),
+            ),
+        )
+
+
+def _resample_equal_length_segments(route_points: list[wp.vec3], segment_length: float) -> tuple[list[wp.vec3], float]:
+    """Resample a polyline route into equal-length cable segments."""
+    points = [route_points[0]]
+    distances = [0.0]
+    total_length = 0.0
+    for route_point in route_points[1:]:
+        length = float(wp.length(route_point - points[-1]))
+        if length <= 1.0e-8:
+            continue
+        total_length += length
+        points.append(route_point)
+        distances.append(total_length)
+
+    segment_count = max(2, int(math.ceil(total_length / segment_length)))
+    equal_length = total_length / float(segment_count)
+    resampled = [points[0]]
+    point_index = 1
+    for segment_index in range(1, segment_count):
+        target_distance = equal_length * float(segment_index)
+        while point_index < len(points) - 1 and distances[point_index] < target_distance:
+            point_index += 1
+
+        previous_distance = distances[point_index - 1]
+        next_distance = distances[point_index]
+        alpha = (target_distance - previous_distance) / (next_distance - previous_distance)
+        resampled.append(points[point_index - 1] * (1.0 - alpha) + points[point_index] * alpha)
+
+    resampled.append(points[-1])
+    return resampled, equal_length
+
+
+def create_block_and_tackle_cable_points(
+    moving_centers: list[wp.vec3],
+    fixed_centers: list[wp.vec3],
+    pull_end: wp.vec3,
+    segment_length: float,
+) -> tuple[list[wp.vec3], float]:
+    """Create the pre-wrapped route for an even supporting-strand tackle."""
+    start = wp.vec3(
+        float(moving_centers[0][0]) - PULLEY_WRAP_RADIUS,
+        float(moving_centers[0][1]),
+        float(fixed_centers[0][2]),
+    )
+    points = [start]
+
+    # Each moving sheave receives two upward tension forces before the cable
+    # exits the final fixed sheave toward the robot.
+    for moving_center, fixed_center in zip(moving_centers, fixed_centers, strict=True):
+        _append_arc_xz(
+            points,
+            moving_center,
+            PULLEY_WRAP_RADIUS,
+            math.pi,
+            2.0 * math.pi,
+            segment_length,
+            direction="ccw",
+        )
+        _append_arc_xz(
+            points,
+            fixed_center,
+            PULLEY_WRAP_RADIUS,
+            math.pi,
+            0.0,
+            segment_length,
+            direction="cw",
+        )
+    _append_route_point(points, pull_end)
+    return _resample_equal_length_segments(points, segment_length)
+
+
+def _filter_body_group_collisions(builder: newton.ModelBuilder, bodies: list[int]) -> None:
+    """Disable cable self-collision while preserving cable-pulley contact."""
+    for i, body_a in enumerate(bodies):
+        for body_b in bodies[i + 1 :]:
+            for shape_a in builder.body_shapes.get(body_a, []):
+                for shape_b in builder.body_shapes.get(body_b, []):
+                    builder.add_shape_collision_filter_pair(int(shape_a), int(shape_b))
+
+
+def _add_visual_box(
+    builder: newton.ModelBuilder,
+    *,
+    body: int,
+    center: wp.vec3,
+    half_extents: tuple[float, float, float],
+    color: tuple[float, float, float],
+    label: str,
+    density: float = 0.0,
+    collision: bool = False,
+) -> int:
+    cfg = newton.ModelBuilder.ShapeConfig(
+        density=density,
+        ke=1.0e5,
+        kd=20.0,
+        mu=0.8,
+        has_shape_collision=collision,
+        has_particle_collision=collision,
+    )
+    return builder.add_shape_box(
+        body=body,
+        xform=wp.transform(center, wp.quat_identity()),
+        hx=half_extents[0],
+        hy=half_extents[1],
+        hz=half_extents[2],
+        cfg=cfg,
+        color=color,
+        label=label,
+    )
+
+
+def add_pulley(
+    builder: newton.ModelBuilder,
+    *,
+    center: wp.vec3,
+    parent: int,
+    parent_origin: wp.vec3,
+    color: tuple[float, float, float],
+    label: str,
+    density: float,
+) -> tuple[int, int]:
+    """Add a passive grooved pulley adapted from cable_cross_slide_table."""
+    body = builder.add_link(
+        xform=wp.transform(center, wp.quat_identity()),
+        label=f"{label}_body",
+    )
+    joint = builder.add_joint_revolute(
+        parent=parent,
+        child=body,
+        axis=wp.vec3(0.0, 1.0, 0.0),
+        parent_xform=wp.transform(center - parent_origin, wp.quat_identity()),
+        child_xform=wp.transform_identity(),
+        armature=1.0e-4,
+        friction=0.0,
+        label=f"{label}_axle",
+    )
+
+    # Match the cross-slide sample's close-fitting groove so the cable cannot
+    # shuttle along the pulley axle before contacting a flange.
+    groove_half_width = 1.55 * CABLE_RADIUS
+    flange_half_thickness = 0.6 * CABLE_RADIUS
+    flange_radius = PULLEY_RADIUS + 3.2 * CABLE_RADIUS
+    align_cylinder_to_y = wp.quat_from_axis_angle(wp.vec3(1.0, 0.0, 0.0), -0.5 * math.pi)
+    sheave_cfg = newton.ModelBuilder.ShapeConfig(
+        density=density,
+        ke=1.0e5,
+        kd=0.0,
+        mu=CABLE_PULLEY_FRICTION,
+    )
+    flange_cfg = newton.ModelBuilder.ShapeConfig(
+        density=density,
+        ke=1.0e5,
+        kd=0.0,
+        mu=0.5 * CABLE_PULLEY_FRICTION,
+    )
+
+    for suffix, y, radius, half_height, cfg, shade in (
+        ("sheave", 0.0, PULLEY_RADIUS, groove_half_width, sheave_cfg, color),
+        (
+            "flange_neg",
+            -(groove_half_width + flange_half_thickness),
+            flange_radius,
+            flange_half_thickness,
+            flange_cfg,
+            tuple(0.68 * component for component in color),
+        ),
+        (
+            "flange_pos",
+            groove_half_width + flange_half_thickness,
+            flange_radius,
+            flange_half_thickness,
+            flange_cfg,
+            tuple(0.68 * component for component in color),
+        ),
+    ):
+        builder.add_shape_cylinder(
+            body=body,
+            xform=wp.transform(wp.vec3(0.0, y, 0.0), align_cylinder_to_y),
+            radius=radius,
+            half_height=half_height,
+            cfg=cfg,
+            color=shade,
+            label=f"{label}_{suffix}",
+        )
+
+    marker_cfg = newton.ModelBuilder.ShapeConfig(
+        density=0.0,
+        has_shape_collision=False,
+        has_particle_collision=False,
+    )
+    builder.add_shape_sphere(
+        body=body,
+        xform=wp.transform(
+            wp.vec3(0.78 * PULLEY_RADIUS, groove_half_width + 2.0 * flange_half_thickness, 0.0),
+            wp.quat_identity(),
+        ),
+        radius=0.75 * CABLE_RADIUS,
+        cfg=marker_cfg,
+        color=(0.96, 0.92, 0.72),
+        label=f"{label}_rotation_dot",
+    )
+    return body, joint
+
+
+class Example:
+    def __init__(self, viewer, args):
+        self.viewer = viewer
+        self.sim_time = 0.0
+        self.fps = 60
+        self.frame_dt = 1.0 / self.fps
+        self.sim_substeps = max(1, int(args.substeps))
+        self.sim_dt = self.frame_dt / self.sim_substeps
+        self.use_graph = bool(args.graph_capture)
+
+        self.travel_reference_load_z: float | None = None
+        self.travel_reference_end_box_z: float | None = None
+        self.latest_tension = 0.0
+        self.latest_robot_downward_force = 0.0
+        self.latest_force_ratio = 0.0
+        self.latest_travel_ratio = 0.0
+
+        self._build_scene()
+        self._build_keyframes()
+        self.control = self.model.control()
+        self._build_ik()
+        self._build_solver(args)
+
+        self.state_0 = self.model.state()
+        self.state_1 = self.model.state()
+        newton.eval_fk(self.model, self.model.joint_q, self.model.joint_qd, self.state_0)
+        newton.eval_fk(self.model, self.model.joint_q, self.model.joint_qd, self.state_1)
+        self._initialize_wrapped_cable()
+        self.solver.sync_entry_states(self.state_0)
+
+        self.collision_pipeline = newton.CollisionPipeline(self.model)
+        self.contacts = self.collision_pipeline.contacts()
+        self.solver.prepare_contacts(self.contacts)
+
+        newton.examples.configure_coupled_view(self, args)
+        if isinstance(self.viewer, newton.viewer.ViewerGL):
+            self.viewer.set_camera(pos=wp.vec3(1.35, -2.1, 1.25), pitch=-10.0, yaw=145.0)
+            if hasattr(self.viewer.camera, "look_at"):
+                self.viewer.camera.look_at(wp.vec3(0.45, 0.0, 0.62))
+
+        self.graph = _capture_frame_graph(self.model, self.simulate, enabled=self.use_graph)
+
+    @staticmethod
+    def _add_franka(builder: newton.ModelBuilder) -> None:
+        builder.add_urdf(
+            newton.utils.download_asset("franka_emika_panda") / "urdf/fr3_franka_hand.urdf",
+            xform=wp.transform(
+                wp.vec3(FRANKA_BASE_X, 0.0, 0.0),
+                wp.quat_from_axis_angle(wp.vec3(0.0, 0.0, 1.0), math.pi),
+            ),
+            floating=False,
+            enable_self_collisions=False,
+            parse_visuals_as_colliders=False,
+            force_show_colliders=False,
+        )
+        builder.joint_q[: len(FRANKA_Q)] = FRANKA_Q
+        builder.joint_target_q[: len(FRANKA_Q)] = FRANKA_Q
+
+        pad_cfg = newton.ModelBuilder.ShapeConfig(
+            density=0.0,
+            ke=GRIPPER_CONTACT_STIFFNESS,
+            kd=GRIPPER_CONTACT_DAMPING,
+            mu=GRIPPER_FRICTION,
+            gap=0.002,
+            is_visible=False,
+        )
+        for finger_label in ("fr3_leftfinger", "fr3_rightfinger"):
+            finger_body = _find_label_index(builder.body_label, finger_label)
+            stock_rubber_shape = int(builder.body_shapes[finger_body][-1])
+            builder.shape_label[stock_rubber_shape] = f"{finger_label}_rubber_contact_pad"
+            builder.add_shape_box(
+                body=finger_body,
+                xform=wp.transform(
+                    wp.vec3(0.0, GRIPPER_PAD_CENTER_Y, GRIPPER_PAD_CENTER_Z),
+                    wp.quat_identity(),
+                ),
+                hx=GRIPPER_PAD_HALF_X,
+                hy=GRIPPER_PAD_HALF_Y,
+                hz=GRIPPER_PAD_HALF_Z,
+                cfg=pad_cfg,
+                color=(0.12, 0.12, 0.14),
+                label=f"{finger_label}_extended_contact_pad",
+            )
+
+    def _build_scene(self) -> None:
+        builder = newton.ModelBuilder(gravity=-GRAVITY)
+        builder.rigid_gap = CABLE_CONTACT_GAP
+        SolverMuJoCo.register_custom_attributes(builder)
+        SolverVBD.register_custom_attributes(builder, dahl_defaults_enabled=False)
+
+        franka_body_start = builder.body_count
+        franka_joint_start = builder.joint_count
+        franka_shape_start = builder.shape_count
+        self._add_franka(builder)
+        builder.joint_target_ke[:7] = [900.0] * 7
+        builder.joint_target_kd[:7] = [90.0] * 7
+        builder.joint_target_ke[7:9] = [5000.0, 5000.0]
+        builder.joint_target_kd[7:9] = [200.0, 200.0]
+        builder.joint_effort_limit[:7] = [80.0] * 7
+        builder.joint_effort_limit[7:9] = [1000.0, 1000.0]
+        builder.joint_armature[:7] = [0.05] * 7
+        self.franka_bodies = list(range(franka_body_start, builder.body_count))
+        self.franka_joints = list(range(franka_joint_start, builder.joint_count))
+        self.franka_shapes = list(range(franka_shape_start, builder.shape_count))
+        self.hand_body = _find_label_index(builder.body_label, "fr3_hand")
+
+        gravcomp = builder.custom_attributes["mujoco:gravcomp"]
+        if gravcomp.values is None:
+            gravcomp.values = {}
+        for body in self.franka_bodies:
+            gravcomp.values[body] = 1.0
+
+        vbd_body_start = builder.body_count
+        vbd_shape_start = builder.shape_count
+        vbd_joints: list[int] = []
+
+        frame_color = (0.16, 0.22, 0.30)
+        _add_visual_box(
+            builder,
+            body=-1,
+            center=wp.vec3(0.5 * (PULLEY_MOVING_X[0] + PULL_X), 0.09, 1.10),
+            half_extents=(0.5 * (PULL_X - PULLEY_MOVING_X[0]) + 0.07, 0.025, 0.025),
+            color=frame_color,
+            label="pulley_frame_top_beam",
+        )
+        for x in (PULLEY_MOVING_X[0] - 0.12, PULL_X + 0.08):
+            _add_visual_box(
+                builder,
+                body=-1,
+                center=wp.vec3(x, 0.09, 0.56),
+                half_extents=(0.025, 0.025, 0.54),
+                color=frame_color,
+                label=f"pulley_frame_post_{x:.2f}",
+            )
+
+        load_center = wp.vec3(0.5 * (PULLEY_MOVING_X[0] + PULLEY_MOVING_X[-1]), 0.0, 0.49)
+        load_half_x = 0.085
+        _add_visual_box(
+            builder,
+            body=-1,
+            center=wp.vec3(float(load_center[0]), 0.0, 0.39),
+            half_extents=(0.14, 0.12, 0.01),
+            color=(0.24, 0.27, 0.30),
+            label="weight_floor",
+            collision=True,
+        )
+        self.weight_body = builder.add_link(
+            xform=wp.transform(load_center, wp.quat_identity()),
+            label="load_weight_body",
+        )
+        weight_half_extents = (load_half_x, 0.06, 0.09)
+        weight_volume = 8.0 * math.prod(weight_half_extents)
+        _add_visual_box(
+            builder,
+            body=self.weight_body,
+            center=wp.vec3(0.0),
+            half_extents=weight_half_extents,
+            density=LOAD_WEIGHT_MASS / weight_volume,
+            collision=True,
+            color=(0.72, 0.16, 0.12),
+            label="load_weight",
+        )
+        load_slide = builder.add_joint_prismatic(
+            parent=-1,
+            child=self.weight_body,
+            axis=wp.vec3(0.0, 0.0, 1.0),
+            parent_xform=wp.transform(load_center, wp.quat_identity()),
+            child_xform=wp.transform_identity(),
+            target_kd=20.0,
+            label="weight_vertical_guide",
+        )
+        vbd_joints.append(load_slide)
+
+        moving_color = (0.88, 0.54, 0.12)
+        fixed_color = (0.12, 0.38, 0.78)
+        moving_centers = [wp.vec3(x, 0.0, PULLEY_MOVING_Z) for x in PULLEY_MOVING_X]
+        fixed_centers = [wp.vec3(x, 0.0, PULLEY_FIXED_Z) for x in PULLEY_FIXED_X]
+
+        moving_bodies = []
+        moving_joints = []
+        for index, center in enumerate(moving_centers):
+            body, joint = add_pulley(
+                builder,
+                center=center,
+                parent=self.weight_body,
+                parent_origin=load_center,
+                color=moving_color,
+                label=f"moving_pulley_{index}",
+                density=1.0e-1,
+            )
+            moving_bodies.append(body)
+            moving_joints.append(joint)
+            vbd_joints.append(joint)
+
+        fixed_joints = []
+        for index, center in enumerate(fixed_centers):
+            _, joint = add_pulley(
+                builder,
+                center=center,
+                parent=-1,
+                parent_origin=wp.vec3(0.0),
+                color=fixed_color,
+                label=f"fixed_pulley_{index}",
+                density=1.0e-1,
+            )
+            fixed_joints.append(joint)
+            vbd_joints.append(joint)
+        builder.add_articulation([load_slide, *moving_joints], label="moving_pulley_block")
+        for index, joint in enumerate(fixed_joints):
+            builder.add_articulation([joint], label=f"fixed_pulley_{index}_articulation")
+
+        self.lifted_mass = sum(float(builder.body_mass[body]) for body in [self.weight_body, *moving_bodies])
+
+        pull_end = wp.vec3(PULL_X, PULL_Y, PULL_START_Z + END_WEIGHT_INITIAL_OFFSET)
+        cable_points, route_segment_length = create_block_and_tackle_cable_points(
+            moving_centers,
+            fixed_centers,
+            pull_end,
+            CABLE_SEGMENT_LENGTH,
+        )
+        cable_quats = newton.utils.create_parallel_transport_cable_quaternions(cable_points)
+        cable_segment_count = len(cable_points) - 1
+        self.cable_segment_length = route_segment_length
+        straight_points, straight_quats = newton.utils.create_straight_cable_points_and_quaternions(
+            start=cable_points[0],
+            direction=wp.vec3(1.0, 0.0, 0.0),
+            length=cable_segment_count * self.cable_segment_length,
+            num_segments=cable_segment_count,
+        )
+        cable_cfg = newton.ModelBuilder.ShapeConfig(
+            density=180.0,
+            ke=1.0e5,
+            kd=0.0,
+            mu=CABLE_PULLEY_FRICTION,
+            gap=CABLE_CONTACT_GAP,
+        )
+        self.cable_bodies, self.cable_joints = builder.add_rod(
+            positions=straight_points,
+            quaternions=straight_quats,
+            radius=CABLE_RADIUS,
+            body_frame_origin="com",
+            cfg=cable_cfg,
+            stretch_stiffness=CABLE_STRETCH_STIFFNESS,
+            stretch_damping=CABLE_STRETCH_DAMPING,
+            bend_stiffness=CABLE_BEND_STIFFNESS,
+            bend_damping=CABLE_BEND_DAMPING,
+            wrap_in_articulation=False,
+            color=(0.82, 0.72, 0.46),
+            label="block_and_tackle_cable",
+        )
+        cable_gravity_compensation = [float(builder.body_mass[body]) * GRAVITY for body in self.cable_bodies]
+        self.initial_cable_xforms = [
+            wp.transform(cable_points[i] + 0.5 * (cable_points[i + 1] - cable_points[i]), cable_quats[i])
+            for i in range(len(self.cable_bodies))
+        ]
+        _filter_body_group_collisions(builder, self.cable_bodies)
+        vbd_joints.extend(self.cable_joints)
+
+        endpoint = 0.5 * self.cable_segment_length
+        self.end_box_center_offset = endpoint + END_BOX_HALF_Z
+        first_endpoint_xform = wp.transform(wp.vec3(0.0, 0.0, -endpoint), wp.quat_identity())
+        anchor_joint = builder.add_joint_ball(
+            parent=-1,
+            child=self.cable_bodies[0],
+            parent_xform=wp.transform(cable_points[0], wp.quat_identity()),
+            child_xform=first_endpoint_xform,
+            label="fixed_cable_anchor",
+        )
+        vbd_joints.append(anchor_joint)
+
+        end_weight_volume = 8.0 * END_BOX_HALF_X * END_BOX_HALF_Y * END_BOX_HALF_Z
+        end_weight_cfg = newton.ModelBuilder.ShapeConfig(
+            density=END_WEIGHT_MASS / end_weight_volume,
+            ke=GRIPPER_CONTACT_STIFFNESS,
+            kd=GRIPPER_CONTACT_DAMPING,
+            mu=GRIPPER_FRICTION,
+            gap=0.002,
+        )
+        builder.add_shape_box(
+            body=self.cable_bodies[-1],
+            xform=wp.transform(
+                wp.vec3(0.0, 0.0, self.end_box_center_offset),
+                wp.quat_identity(),
+            ),
+            hx=END_BOX_HALF_X,
+            hy=END_BOX_HALF_Y,
+            hz=END_BOX_HALF_Z,
+            cfg=end_weight_cfg,
+            color=(0.96, 0.78, 0.26),
+            label="graspable_end_weight",
+        )
+        builder.add_articulation(
+            [*self.cable_joints, anchor_joint],
+            label="block_and_tackle_cable",
+        )
+
+        anchor_cfg = newton.ModelBuilder.ShapeConfig(
+            density=0.0,
+            has_shape_collision=False,
+            has_particle_collision=False,
+        )
+        builder.add_shape_sphere(
+            body=-1,
+            xform=wp.transform(cable_points[0], wp.quat_identity()),
+            radius=2.0 * CABLE_RADIUS,
+            cfg=anchor_cfg,
+            color=(0.86, 0.82, 0.70),
+            label="fixed_cable_anchor_marker",
+        )
+
+        self.vbd_bodies = list(range(vbd_body_start, builder.body_count))
+        self.vbd_joints = vbd_joints
+        self.vbd_shapes = list(range(vbd_shape_start, builder.shape_count))
+
+        self.gripper_bodies = [body for body in self.franka_bodies if "finger" in builder.body_label[body]]
+        self.gripper_contact_shapes = {
+            shape for shape in self.franka_shapes if builder.shape_label[shape].endswith("_contact_pad")
+        }
+        for franka_shape in self.franka_shapes:
+            if franka_shape in self.gripper_contact_shapes:
+                continue
+            for vbd_shape in self.vbd_shapes:
+                builder.add_shape_collision_filter_pair(franka_shape, vbd_shape)
+
+        builder.color(balance_colors=False)
+        self.model = builder.finalize()
+        self.device = self.model.device
+        self.cable_body_indices = wp.array(self.cable_bodies, dtype=wp.int32, device=self.device)
+        self.cable_gravity_compensation = wp.array(
+            cable_gravity_compensation,
+            dtype=float,
+            device=self.device,
+        )
+
+        gripper_contact_shapes = list(self.gripper_contact_shapes)
+        shape_ke = self.model.shape_material_ke.numpy()
+        shape_kd = self.model.shape_material_kd.numpy()
+        shape_mu = self.model.shape_material_mu.numpy()
+        shape_ke[gripper_contact_shapes] = GRIPPER_CONTACT_STIFFNESS
+        shape_kd[gripper_contact_shapes] = GRIPPER_CONTACT_DAMPING
+        shape_mu[gripper_contact_shapes] = GRIPPER_FRICTION
+        self.model.shape_material_ke.assign(shape_ke)
+        self.model.shape_material_kd.assign(shape_kd)
+        self.model.shape_material_mu.assign(shape_mu)
+
+        tension_span_x = float(cable_points[0][0])
+        tension_span_z_min = PULLEY_MOVING_Z + 2.0 * PULLEY_WRAP_RADIUS
+        tension_span_z_max = PULLEY_FIXED_Z - 2.0 * PULLEY_WRAP_RADIUS
+        self.cable_tension_joints = [
+            joint
+            for index, joint in enumerate(self.cable_joints)
+            if abs(float(cable_points[index + 1][0]) - tension_span_x) < 0.25 * CABLE_SEGMENT_LENGTH
+            and tension_span_z_min < float(cable_points[index + 1][2]) < tension_span_z_max
+        ]
+        if len(self.cable_tension_joints) < 3:
+            raise ValueError("Could not find a quiet straight cable span for tension measurement")
+        self.joint_parent = self.model.joint_parent.numpy()
+        self.joint_child = self.model.joint_child.numpy()
+        self.joint_X_p = self.model.joint_X_p.numpy()
+        self.joint_X_c = self.model.joint_X_c.numpy()
+
+    def _build_solver(self, args) -> None:
+        self.solver = SolverCoupledProxy(
+            model=self.model,
+            entries=[
+                SolverCoupled.Entry(
+                    name="mjc",
+                    solver=lambda view: SolverMuJoCo(
+                        model=view,
+                        solver="newton",
+                        integrator="implicitfast",
+                        iterations=int(args.mujoco_iterations),
+                        ls_iterations=int(args.mujoco_ls_iterations),
+                        use_mujoco_contacts=False,
+                        njmax=256,
+                        nconmax=64,
+                    ),
+                    bodies=self.franka_bodies,
+                    joints=self.franka_joints,
+                    shapes=self.franka_shapes,
+                ),
+                SolverCoupled.Entry(
+                    name="vbd",
+                    solver=lambda view: SolverVBD(
+                        model=view,
+                        iterations=int(args.vbd_iterations),
+                        rigid_body_contact_buffer_size=512,
+                        rigid_contact_hard=False,
+                        rigid_contact_history=False,
+                    ),
+                    bodies=self.vbd_bodies,
+                    joints=self.vbd_joints,
+                    shapes=self.vbd_shapes,
+                ),
+            ],
+            coupling=SolverCoupledProxy.Config(
+                proxies=[
+                    SolverCoupledProxy.Proxy(
+                        source="mjc",
+                        destination="vbd",
+                        bodies=self.gripper_bodies,
+                        mass_scale=float(1),
+                        mode=str(args.coupling_mode),
+                        collision_pipeline=lambda model: newton.examples.create_collision_pipeline(
+                            model,
+                            broad_phase="explicit",
+                        ),
+                        collide_interval=1,
+                    )
+                ],
+                iterations=int(args.proxy_iterations),
+            ),
+        )
+        self.mujoco_solver = self.solver.solver("mjc")
+        mujoco_view = self.solver.view("mjc")
+        finger_local_bodies = {i for i, label in enumerate(mujoco_view.body_label) if "finger" in label}
+        mujoco_body_to_newton = self.mujoco_solver.mjc_body_to_newton.numpy()[0]
+        self.mujoco_finger_bodies = [
+            i for i, body in enumerate(mujoco_body_to_newton) if int(body) in finger_local_bodies
+        ]
+        if len(self.mujoco_finger_bodies) != 2:
+            raise ValueError("Could not map both Franka finger bodies into MuJoCo")
+
+    def _build_keyframes(self) -> None:
+        start_position, start_rotation = self._initial_tcp_pose()
+        approach_qx, approach_qy, approach_qz, approach_qw = GRIPPER_APPROACH_ORIENTATION
+        approach_rotation = np.array(
+            [approach_qx, approach_qy, approach_qz, approach_qw],
+            dtype=np.float32,
+        )
+        if float(np.dot(start_rotation, approach_rotation)) < 0.0:
+            start_rotation = -start_rotation
+        pregrasp_x = GRASP_TCP_X
+        pregrasp_z = GRASP_TCP_Z
+        approach_x = pregrasp_x + 0.14
+        approach_z = pregrasp_z + 0.14 * math.tan(GRIPPER_APPROACH_ANGLE)
+        grasp_z = GRASP_TCP_Z
+        poses = np.array(
+            [
+                [INITIAL_HOLD_DURATION, *start_position.tolist(), *start_rotation.tolist(), GRIP_OPEN],
+                [
+                    APPROACH_DURATION,
+                    approach_x,
+                    GRIPPER_TARGET_Y,
+                    approach_z,
+                    approach_qx,
+                    approach_qy,
+                    approach_qz,
+                    approach_qw,
+                    GRIP_OPEN,
+                ],
+                [
+                    SIDE_APPROACH_DURATION,
+                    pregrasp_x,
+                    GRIPPER_TARGET_Y,
+                    pregrasp_z,
+                    approach_qx,
+                    approach_qy,
+                    approach_qz,
+                    approach_qw,
+                    GRIP_OPEN,
+                ],
+                [
+                    PREGRASP_HOLD_DURATION,
+                    pregrasp_x,
+                    GRIPPER_TARGET_Y,
+                    pregrasp_z,
+                    approach_qx,
+                    approach_qy,
+                    approach_qz,
+                    approach_qw,
+                    GRIP_OPEN,
+                ],
+                [
+                    GRASP_DURATION,
+                    GRASP_TCP_X,
+                    GRIPPER_TARGET_Y,
+                    grasp_z,
+                    approach_qx,
+                    approach_qy,
+                    approach_qz,
+                    approach_qw,
+                    GRIP_CLOSE,
+                ],
+                [
+                    PULL_DURATION,
+                    GRASP_TCP_X,
+                    GRIPPER_TARGET_Y,
+                    PULL_END_Z,
+                    approach_qx,
+                    approach_qy,
+                    approach_qz,
+                    approach_qw,
+                    GRIP_CLOSE,
+                ],
+                [
+                    FINAL_HOLD_DURATION,
+                    GRASP_TCP_X,
+                    GRIPPER_TARGET_Y,
+                    PULL_END_Z,
+                    approach_qx,
+                    approach_qy,
+                    approach_qz,
+                    approach_qw,
+                    GRIP_CLOSE,
+                ],
+            ],
+            dtype=np.float32,
+        )
+        self.targets = poses[:, 1:]
+        self.key_times = np.cumsum(poses[:, 0])
+
+    def _initial_tcp_pose(self) -> tuple[np.ndarray, np.ndarray]:
+        state = self.model.state()
+        newton.eval_fk(self.model, self.model.joint_q, self.model.joint_qd, state)
+        hand_q = state.body_q.numpy()[self.hand_body]
+        position = self._transform_point(hand_q, np.array([0.0, 0.0, 0.107], dtype=np.float64))
+        rotation = np.asarray(hand_q[3:7], dtype=np.float32)
+        return position.astype(np.float32), rotation
+
+    def _build_ik(self) -> None:
+        ik_builder = newton.ModelBuilder(gravity=-GRAVITY)
+        self._add_franka(ik_builder)
+        self.ik_model = ik_builder.finalize(device=self.device)
+        self.n_coords = self.ik_model.joint_coord_count
+        self.ik_joint_q = wp.clone(self.model.joint_q.reshape((1, -1))[:, : self.n_coords])
+        self.control_joint_target_q = self.control.joint_target_q.reshape((1, -1))
+        self.finger_index_0 = self.n_coords - 2
+        self.finger_index_1 = self.n_coords - 1
+        self.finger_position = wp.full(1, GRIP_OPEN, dtype=float, device=self.device)
+
+        target = self.targets[0]
+        self.ik_target_positions = wp.array([wp.vec3(*target[:3].tolist())], dtype=wp.vec3, device=self.device)
+        self.ik_target_rotations = wp.array([wp.vec4(*target[3:7].tolist())], dtype=wp.vec4, device=self.device)
+        ik_hand_body = _find_label_index(self.ik_model.body_label, "fr3_hand")
+        position_objective = ik.IKObjectivePosition(
+            link_index=ik_hand_body,
+            link_offset=wp.vec3(0.0, 0.0, 0.107),
+            target_positions=self.ik_target_positions,
+        )
+        rotation_objective = ik.IKObjectiveRotation(
+            link_index=ik_hand_body,
+            link_offset_rotation=wp.quat_identity(),
+            target_rotations=self.ik_target_rotations,
+        )
+        joint_limits_objective = ik.IKObjectiveJointLimit(
+            joint_limit_lower=wp.clone(self.model.joint_limit_lower[: self.n_coords]),
+            joint_limit_upper=wp.clone(self.model.joint_limit_upper[: self.n_coords]),
+            weight=10.0,
+        )
+        self.ik_solver = ik.IKSolver(
+            model=self.ik_model,
+            n_problems=1,
+            objectives=[position_objective, rotation_objective, joint_limits_objective],
+            lambda_initial=0.05,
+            jacobian_mode=ik.IKJacobianType.ANALYTIC,
+        )
+        self.ik_iters = 24
+
+    def _initialize_wrapped_cable(self) -> None:
+        cable_body_indices = wp.array(self.cable_bodies, dtype=wp.int32, device=self.device)
+        cable_body_xforms = wp.array(self.initial_cable_xforms, dtype=wp.transform, device=self.device)
+        wp.launch(
+            set_body_xforms,
+            dim=cable_body_indices.shape[0],
+            inputs=[
+                cable_body_indices,
+                cable_body_xforms,
+                self.state_0.body_q,
+                self.state_1.body_q,
+            ],
+            device=self.device,
+        )
+
+    def update_ik_target(self) -> None:
+        t = min(self.sim_time, float(self.key_times[-1]) - 1.0e-6)
+        interval = int(np.searchsorted(self.key_times, t))
+        start_time = self.key_times[interval - 1] if interval > 0 else 0.0
+        end_time = self.key_times[interval]
+        alpha = float(np.clip((t - start_time) / max(end_time - start_time, 1.0e-6), 0.0, 1.0))
+        current = self.targets[interval]
+        previous = self.targets[interval - 1] if interval > 0 else current
+        target = (1.0 - alpha) * previous + alpha * current
+
+        wp.launch(
+            set_task_target,
+            dim=1,
+            inputs=[
+                self.ik_target_positions,
+                self.ik_target_rotations,
+                self.finger_position,
+                wp.vec3(*target[:3].tolist()),
+                wp.vec4(*target[3:7].tolist()),
+                float(target[-1]),
+            ],
+            device=self.device,
+        )
+
+    def simulate(self) -> None:
+        self.ik_solver.step(self.ik_joint_q, self.ik_joint_q, iterations=self.ik_iters)
+        wp.launch(
+            set_gripper_target,
+            dim=1,
+            inputs=[self.ik_joint_q, self.finger_position, self.finger_index_0, self.finger_index_1],
+            device=self.device,
+        )
+        wp.copy(dest=self.control_joint_target_q[:, : self.n_coords], src=self.ik_joint_q)
+
+        for _ in range(self.sim_substeps):
+            self.state_0.clear_forces()
+            newton.examples.apply_coupled_viewer_forces(self, self.state_0)
+            self.model.collide(self.state_0, self.contacts, collision_pipeline=self.collision_pipeline)
+            self.solver.step(self.state_0, self.state_1, self.control, self.contacts, self.sim_dt)
+            newton.eval_ik(self.model, self.state_1, self.state_1.joint_q, self.state_1.joint_qd)
+            self.state_0, self.state_1 = self.state_1, self.state_0
+
+    @staticmethod
+    def _transform_point(pose: np.ndarray, local_point: np.ndarray) -> np.ndarray:
+        rotation = wp.quat(float(pose[3]), float(pose[4]), float(pose[5]), float(pose[6]))
+        rotated = wp.quat_rotate(
+            rotation,
+            wp.vec3(float(local_point[0]), float(local_point[1]), float(local_point[2])),
+        )
+        return np.array(
+            [
+                float(pose[0]) + float(rotated[0]),
+                float(pose[1]) + float(rotated[1]),
+                float(pose[2]) + float(rotated[2]),
+            ],
+            dtype=np.float64,
+        )
+
+    def _measure_cable_tension(self, body_q: np.ndarray) -> float:
+        tensions = []
+        for joint in self.cable_tension_joints:
+            parent = int(self.joint_parent[joint])
+            child = int(self.joint_child[joint])
+            parent_anchor = self._transform_point(body_q[parent], self.joint_X_p[joint, :3])
+            child_anchor = self._transform_point(body_q[child], self.joint_X_c[joint, :3])
+            tensions.append(CABLE_STRETCH_STIFFNESS * float(np.linalg.norm(child_anchor - parent_anchor)))
+        return float(np.median(tensions))
+
+    def _end_box_z(self, body_q: np.ndarray) -> float:
+        center = self._transform_point(
+            body_q[self.cable_bodies[-1]],
+            np.array([0.0, 0.0, self.end_box_center_offset], dtype=np.float64),
+        )
+        return float(center[2])
+
+    def _measure_robot_downward_force(self) -> float:
+        if self.mujoco_solver.use_mujoco_cpu:
+            applied_wrenches = np.asarray(self.mujoco_solver.mj_data.xfrc_applied)
+        else:
+            applied_wrenches = self.mujoco_solver.mjw_data.xfrc_applied.numpy()[0]
+        upward_reaction = float(np.sum(applied_wrenches[self.mujoco_finger_bodies, 2]))
+        return max(0.0, upward_reaction)
+
+    def _record_diagnostics(self) -> None:
+        body_q = self.state_0.body_q.numpy()
+        self.latest_tension = self._measure_cable_tension(body_q)
+        self.latest_robot_downward_force = self._measure_robot_downward_force()
+        load_z = float(body_q[self.weight_body, 2])
+        end_box_z = self._end_box_z(body_q)
+
+        if (
+            self.travel_reference_load_z is None
+            or load_z <= self.travel_reference_load_z + TRAVEL_REFERENCE_LIFT_EPSILON
+        ):
+            # Follow the box while the load rests on the floor, then retain the
+            # last position before lift. This is always active for scripted and
+            # interactive pulls without relying on trajectory timing.
+            self.travel_reference_load_z = load_z
+            self.travel_reference_end_box_z = end_box_z
+
+        if self.latest_tension > 1.0e-6:
+            self.latest_force_ratio = self.lifted_mass * GRAVITY / self.latest_tension
+        if self.travel_reference_load_z is not None and self.travel_reference_end_box_z is not None:
+            lift = load_z - self.travel_reference_load_z
+            pull = self.travel_reference_end_box_z - end_box_z
+            if lift > TRAVEL_REFERENCE_LIFT_EPSILON:
+                self.latest_travel_ratio = pull / lift
+            else:
+                self.latest_travel_ratio = 0.0
+        print(f"{LOAD_WEIGHT_MASS}")
+        self.viewer.log_scalar("Cable tension [N]", self.latest_tension, smoothing=10)
+        self.viewer.log_scalar("Robot downward force [N]", self.latest_robot_downward_force, smoothing=10)
+        self.viewer.log_scalar("Measured force advantage", self.latest_force_ratio)
+        self.viewer.log_scalar("Measured travel ratio", self.latest_travel_ratio)
+        self.viewer.log_scalar("Grasped box height [m]", end_box_z)
+        self.viewer.log_scalar("Weight height [m]", load_z)
+
+    def step(self) -> None:
+        self.update_ik_target()
+        if not _launch_frame_graph(self.model, self.graph):
+            self.simulate()
+        self.sim_time += self.frame_dt
+        self._record_diagnostics()
+
+    def render(self) -> None:
+        self.viewer.begin_frame(self.sim_time)
+        newton.examples.log_coupled_view(self, self.contacts)
+        self.viewer.end_frame()
+
+    def test_post_step(self) -> None:
+        body_q = self.state_0.body_q.numpy()
+        body_qd = self.state_0.body_qd.numpy()
+        if not np.all(np.isfinite(body_q)) or not np.all(np.isfinite(body_qd)):
+            raise ValueError("Pulley mechanism contains NaN or inf body state")
+
+    def test_final(self) -> None:
+        if self.travel_reference_load_z is None or self.travel_reference_end_box_z is None:
+            raise ValueError("Travel reporting was not initialized")
+        if self.latest_tension < 1.0:
+            raise ValueError("The Franka grasp never transmitted load into the VBD cable")
+
+        body_q = self.state_0.body_q.numpy()
+        final_load_z = float(body_q[self.weight_body, 2])
+        final_end_box_z = self._end_box_z(body_q)
+        load_lift = final_load_z - self.travel_reference_load_z
+        end_box_pull = self.travel_reference_end_box_z - final_end_box_z
+        travel_ratio = end_box_pull / max(load_lift, 1.0e-8)
+
+        measured_tension = self.latest_tension
+        lifted_force = self.lifted_mass * GRAVITY
+        expected_tension = lifted_force / MECHANICAL_ADVANTAGE
+        force_ratio = lifted_force / max(measured_tension, 1.0e-8)
+
+        travel_ratio_lower = 0.8 * MECHANICAL_ADVANTAGE
+        travel_ratio_upper = 1.2 * MECHANICAL_ADVANTAGE
+        force_ratio_lower = 0.85 * MECHANICAL_ADVANTAGE
+        force_ratio_upper = 1.15 * MECHANICAL_ADVANTAGE
+        if load_lift < 0.035:
+            raise ValueError(
+                f"The {WEIGHT_MASS:.0f} kg weight lifted only {load_lift:.3f} m; expected at least 0.035 m"
+            )
+        if not travel_ratio_lower <= travel_ratio <= travel_ratio_upper:
+            raise ValueError(
+                f"Pulley travel ratio is {travel_ratio:.2f}; expected approximately {MECHANICAL_ADVANTAGE:.1f}"
+            )
+        if not math.isclose(measured_tension, expected_tension, rel_tol=0.15):
+            raise ValueError(
+                f"Robot cable force is {measured_tension:.2f} N; expected {expected_tension:.2f} N "
+                f"for an {MECHANICAL_ADVANTAGE:.0f}:1 lift"
+            )
+        if not force_ratio_lower <= force_ratio <= force_ratio_upper:
+            raise ValueError(
+                f"Measured force advantage is {force_ratio:.2f}; expected approximately {MECHANICAL_ADVANTAGE:.1f}"
+            )
+        if self.use_graph and self.device.is_cuda and self.graph is None:
+            raise ValueError("CUDA graph capture was requested but no graph was captured")
+
+    @staticmethod
+    def create_parser():
+        parser = newton.examples.create_parser()
+        newton.examples.add_coupled_view_args(parser)
+        parser.add_argument("--substeps", type=int, default=16, help="Coupled substeps per rendered frame.")
+        parser.add_argument(
+            "--proxy-iterations", type=int, default=1, help="Proxy relaxation passes per coupled substep."
+        )
+        parser.add_argument(
+            "--mass-scale",
+            type=float,
+            default=1.0,
+            help="Scale applied to the gripper effective mass in the VBD proxy solve.",
+        )
+        parser.add_argument(
+            "--coupling-mode",
+            choices=["lagged", "staggered"],
+            default="lagged",
+            help="Proxy transfer mode.",
+        )
+        parser.add_argument("--vbd-iterations", type=int, default=20, help="VBD iterations per coupled substep.")
+        parser.add_argument("--mujoco-iterations", type=int, default=20, help="MuJoCo solver iterations.")
+        parser.add_argument("--mujoco-ls-iterations", type=int, default=20, help="MuJoCo line-search iterations.")
+        parser.add_argument(
+            "--no-graph-capture",
+            action="store_false",
+            dest="graph_capture",
+            default=True,
+            help="Disable CUDA graph capture.",
+        )
+        return parser
+
+
+if __name__ == "__main__":
+    parser = Example.create_parser()
+    parser.set_defaults(num_frames=int(math.ceil(EXAMPLE_DURATION * 60.0)))
+    viewer, args = newton.examples.init(parser)
+    example = Example(viewer, args)
+    newton.examples.run(example, args)
