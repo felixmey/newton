@@ -7,9 +7,9 @@
 # A MuJoCo-simulated Franka follows an IK trajectory that pulls the free end
 # of a VBD cable. Two moving and two fixed VBD pulleys form a 4:1 block and
 # tackle that lifts a 5 kg guided weight. The hand approaches and closes on
-# a thin box attached directly to the cable end, and SolverCoupledProxy transfers
-# soft-contact force between the MuJoCo gripper and the VBD mechanism without
-# a fixed robot-cable attachment.
+# a thin box attached directly to the cable end. SolverCoupledADMM transfers
+# contact force between the MuJoCo gripper and the VBD mechanism without a
+# fixed robot-cable attachment.
 #
 # The cable is initialized as a straight rod and its body transforms are then
 # placed on an explicitly pre-wrapped route, following the initialization used
@@ -29,7 +29,7 @@ from collections.abc import Callable
 
 import numpy as np
 import warp as wp
-from newton.solvers.experimental.coupled import SolverCoupled, SolverCoupledProxy
+from newton.solvers.experimental.coupled import SolverCoupled, SolverCoupledADMM, SolverCoupledProxy
 
 import newton
 import newton.examples
@@ -38,7 +38,7 @@ import newton.utils
 from newton.solvers import SolverMuJoCo, SolverVBD
 
 MECHANICAL_ADVANTAGE = 4.0
-WEIGHT_MASS = 8.0
+WEIGHT_MASS = 5.0
 END_WEIGHT_MASS = 0.1
 LOAD_WEIGHT_MASS = WEIGHT_MASS + END_WEIGHT_MASS * MECHANICAL_ADVANTAGE
 GRAVITY = 9.81
@@ -95,9 +95,7 @@ PREGRASP_HOLD_DURATION = 1.6
 GRASP_DURATION = 1.0
 PULL_DURATION = 8.0
 FINAL_HOLD_DURATION = 2.0
-GRASP_END_TIME = (
-    INITIAL_HOLD_DURATION + APPROACH_DURATION + SIDE_APPROACH_DURATION + PREGRASP_HOLD_DURATION + GRASP_DURATION
-)
+GRASP_END_TIME = INITIAL_HOLD_DURATION + APPROACH_DURATION + SIDE_APPROACH_DURATION + GRASP_DURATION
 PULL_END_TIME = GRASP_END_TIME + PULL_DURATION
 EXAMPLE_DURATION = PULL_END_TIME + FINAL_HOLD_DURATION
 TRAVEL_REFERENCE_LIFT_EPSILON = 5.0e-4
@@ -434,9 +432,12 @@ class Example:
         self.sim_substeps = max(1, int(args.substeps))
         self.sim_dt = self.frame_dt / self.sim_substeps
         self.use_graph = bool(args.graph_capture)
+        self.coupling_solver = str(args.coupling_solver)
 
         self.travel_reference_load_z: float | None = None
         self.travel_reference_end_box_z: float | None = None
+        self.box_target_center: np.ndarray | None = None
+        self.pull_target_origin: np.ndarray | None = None
         self.latest_tension = 0.0
         self.latest_robot_downward_force = 0.0
         self.latest_force_ratio = 0.0
@@ -453,6 +454,7 @@ class Example:
         newton.eval_fk(self.model, self.model.joint_q, self.model.joint_qd, self.state_0)
         newton.eval_fk(self.model, self.model.joint_q, self.model.joint_qd, self.state_1)
         self._initialize_wrapped_cable()
+        self.box_target_center = self._end_box_center(self.state_0.body_q.numpy())
         self.solver.sync_entry_states(self.state_0)
 
         self.collision_pipeline = newton.CollisionPipeline(self.model)
@@ -655,7 +657,7 @@ class Example:
             num_segments=cable_segment_count,
         )
         cable_cfg = newton.ModelBuilder.ShapeConfig(
-            density=180.0,
+            density=10.0,
             ke=1.0e5,
             kd=0.0,
             mu=CABLE_PULLEY_FRICTION,
@@ -787,57 +789,73 @@ class Example:
         self.joint_X_c = self.model.joint_X_c.numpy()
 
     def _build_solver(self, args) -> None:
-        self.solver = SolverCoupledProxy(
-            model=self.model,
-            entries=[
-                SolverCoupled.Entry(
-                    name="mjc",
-                    solver=lambda view: SolverMuJoCo(
-                        model=view,
-                        solver="newton",
-                        integrator="implicitfast",
-                        iterations=int(args.mujoco_iterations),
-                        ls_iterations=int(args.mujoco_ls_iterations),
-                        use_mujoco_contacts=False,
-                        njmax=256,
-                        nconmax=64,
-                    ),
-                    bodies=self.franka_bodies,
-                    joints=self.franka_joints,
-                    shapes=self.franka_shapes,
+        entries = [
+            SolverCoupled.Entry(
+                name="mjc",
+                solver=lambda view: SolverMuJoCo(
+                    model=view,
+                    solver="newton",
+                    integrator="implicitfast",
+                    iterations=int(args.mujoco_iterations),
+                    ls_iterations=int(args.mujoco_ls_iterations),
+                    use_mujoco_contacts=False,
+                    njmax=256,
+                    nconmax=64,
                 ),
-                SolverCoupled.Entry(
-                    name="vbd",
-                    solver=lambda view: SolverVBD(
-                        model=view,
-                        iterations=int(args.vbd_iterations),
-                        rigid_body_contact_buffer_size=512,
-                        rigid_contact_hard=False,
-                        rigid_contact_history=False,
-                    ),
-                    bodies=self.vbd_bodies,
-                    joints=self.vbd_joints,
-                    shapes=self.vbd_shapes,
-                ),
-            ],
-            coupling=SolverCoupledProxy.Config(
-                proxies=[
-                    SolverCoupledProxy.Proxy(
-                        source="mjc",
-                        destination="vbd",
-                        bodies=self.gripper_bodies,
-                        mass_scale=float(1),
-                        mode=str(args.coupling_mode),
-                        collision_pipeline=lambda model: newton.examples.create_collision_pipeline(
-                            model,
-                            broad_phase="explicit",
-                        ),
-                        collide_interval=1,
-                    )
-                ],
-                iterations=int(args.proxy_iterations),
+                bodies=self.franka_bodies,
+                joints=self.franka_joints,
+                shapes=self.franka_shapes,
             ),
-        )
+            SolverCoupled.Entry(
+                name="vbd",
+                solver=lambda view: SolverVBD(
+                    model=view,
+                    iterations=int(args.vbd_iterations),
+                    rigid_body_contact_buffer_size=512,
+                    rigid_contact_hard=False,
+                    rigid_contact_history=False,
+                ),
+                bodies=self.vbd_bodies,
+                joints=self.vbd_joints,
+                shapes=self.vbd_shapes,
+            ),
+        ]
+        if self.coupling_solver == "admm":
+            self.solver = SolverCoupledADMM(
+                model=self.model,
+                entries=entries,
+                coupling=SolverCoupledADMM.Config(
+                    iterations=int(args.admm_iterations),
+                    rho=float(args.rho),
+                    gamma=float(args.gamma),
+                    baumgarte=float(args.baumgarte),
+                    rigid_contact_matching=str(args.rigid_contact_matching),
+                    contact_matching_force_scale=float(args.contact_matching_force_scale),
+                    contact_pairs=[SolverCoupledADMM.ContactPair(source="mjc", destination="vbd")],
+                ),
+            )
+        else:
+            self.solver = SolverCoupledProxy(
+                model=self.model,
+                entries=entries,
+                coupling=SolverCoupledProxy.Config(
+                    proxies=[
+                        SolverCoupledProxy.Proxy(
+                            source="mjc",
+                            destination="vbd",
+                            bodies=self.gripper_bodies,
+                            mass_scale=float(args.mass_scale),
+                            mode=str(args.coupling_mode),
+                            collision_pipeline=lambda model: newton.examples.create_collision_pipeline(
+                                model,
+                                broad_phase="explicit",
+                            ),
+                            collide_interval=1,
+                        )
+                    ],
+                    iterations=int(args.proxy_iterations),
+                ),
+            )
         self.mujoco_solver = self.solver.solver("mjc")
         mujoco_view = self.solver.view("mjc")
         finger_local_bodies = {i for i, label in enumerate(mujoco_view.body_label) if "finger" in label}
@@ -887,17 +905,17 @@ class Example:
                     approach_qw,
                     GRIP_OPEN,
                 ],
-                [
-                    PREGRASP_HOLD_DURATION,
-                    pregrasp_x,
-                    GRIPPER_TARGET_Y,
-                    pregrasp_z,
-                    approach_qx,
-                    approach_qy,
-                    approach_qz,
-                    approach_qw,
-                    GRIP_OPEN,
-                ],
+                # [
+                #    PREGRASP_HOLD_DURATION,
+                #    pregrasp_x,
+                #    GRIPPER_TARGET_Y,
+                #    pregrasp_z,
+                #    approach_qx,
+                #    approach_qy,
+                #    approach_qz,
+                #    approach_qw,
+                #    GRIP_OPEN,
+                # ],
                 [
                     GRASP_DURATION,
                     GRASP_TCP_X,
@@ -936,6 +954,11 @@ class Example:
         )
         self.targets = poses[:, 1:]
         self.key_times = np.cumsum(poses[:, 0])
+        self.nominal_grasp_position = np.array(
+            [GRASP_TCP_X, GRIPPER_TARGET_Y, GRASP_TCP_Z],
+            dtype=np.float32,
+        )
+        self.pull_keyframe_index = len(poses) - 2
 
     def _initial_tcp_pose(self) -> tuple[np.ndarray, np.ndarray]:
         state = self.model.state()
@@ -1009,6 +1032,25 @@ class Example:
         previous = self.targets[interval - 1] if interval > 0 else current
         target = (1.0 - alpha) * previous + alpha * current
 
+        if interval > 0:
+            if self.box_target_center is None:
+                raise RuntimeError("Gripper-box target center was not initialized")
+            if interval >= self.pull_keyframe_index:
+                if self.pull_target_origin is None:
+                    # Box motion must not feed back into the commanded pull distance.
+                    self.pull_target_origin = self.box_target_center.copy()
+                target_center = self.pull_target_origin
+            else:
+                target_center = self.box_target_center
+
+            center_offset = target_center - self.nominal_grasp_position
+            current_position = current[:3] + center_offset
+            if interval == 1:
+                previous_position = previous[:3]
+            else:
+                previous_position = previous[:3] + center_offset
+            target[:3] = (1.0 - alpha) * previous_position + alpha * current_position
+
         wp.launch(
             set_task_target,
             dim=1,
@@ -1067,12 +1109,14 @@ class Example:
             tensions.append(CABLE_STRETCH_STIFFNESS * float(np.linalg.norm(child_anchor - parent_anchor)))
         return float(np.median(tensions))
 
-    def _end_box_z(self, body_q: np.ndarray) -> float:
-        center = self._transform_point(
+    def _end_box_center(self, body_q: np.ndarray) -> np.ndarray:
+        return self._transform_point(
             body_q[self.cable_bodies[-1]],
             np.array([0.0, 0.0, self.end_box_center_offset], dtype=np.float64),
         )
-        return float(center[2])
+
+    def _end_box_z(self, body_q: np.ndarray) -> float:
+        return float(self._end_box_center(body_q)[2])
 
     def _measure_robot_downward_force(self) -> float:
         if self.mujoco_solver.use_mujoco_cpu:
@@ -1087,7 +1131,8 @@ class Example:
         self.latest_tension = self._measure_cable_tension(body_q)
         self.latest_robot_downward_force = self._measure_robot_downward_force()
         load_z = float(body_q[self.weight_body, 2])
-        end_box_z = self._end_box_z(body_q)
+        self.box_target_center = self._end_box_center(body_q)
+        end_box_z = float(self.box_target_center[2])
 
         if (
             self.travel_reference_load_z is None
@@ -1108,7 +1153,6 @@ class Example:
                 self.latest_travel_ratio = pull / lift
             else:
                 self.latest_travel_ratio = 0.0
-        print(f"{LOAD_WEIGHT_MASS}")
         self.viewer.log_scalar("Cable tension [N]", self.latest_tension, smoothing=10)
         self.viewer.log_scalar("Robot downward force [N]", self.latest_robot_downward_force, smoothing=10)
         self.viewer.log_scalar("Measured force advantage", self.latest_force_ratio)
@@ -1173,6 +1217,13 @@ class Example:
             raise ValueError(
                 f"Measured force advantage is {force_ratio:.2f}; expected approximately {MECHANICAL_ADVANTAGE:.1f}"
             )
+        if self.coupling_solver == "admm":
+            expected_robot_force = expected_tension - END_WEIGHT_MASS * GRAVITY
+            if not math.isclose(self.latest_robot_downward_force, expected_robot_force, rel_tol=0.25):
+                raise ValueError(
+                    f"MuJoCo gripper force is {self.latest_robot_downward_force:.2f} N; "
+                    f"expected {expected_robot_force:.2f} N after accounting for the end weight"
+                )
         if self.use_graph and self.device.is_cuda and self.graph is None:
             raise ValueError("CUDA graph capture was requested but no graph was captured")
 
@@ -1181,6 +1232,28 @@ class Example:
         parser = newton.examples.create_parser()
         newton.examples.add_coupled_view_args(parser)
         parser.add_argument("--substeps", type=int, default=16, help="Coupled substeps per rendered frame.")
+        parser.add_argument(
+            "--coupling-solver",
+            choices=["admm", "proxy"],
+            default="admm",
+            help="Cross-solver contact coupling method.",
+        )
+        parser.add_argument("--admm-iterations", type=int, default=1, help="ADMM iterations per coupled substep.")
+        parser.add_argument("--rho", type=float, default=200.0, help="ADMM penalty parameter.")
+        parser.add_argument("--gamma", type=float, default=0.001, help="ADMM proximal metric scale.")
+        parser.add_argument("--baumgarte", type=float, default=0.5, help="ADMM position error correction fraction.")
+        parser.add_argument(
+            "--rigid-contact-matching",
+            choices=["disabled", "latest", "sticky"],
+            default="sticky",
+            help="ADMM gripper contact matching mode.",
+        )
+        parser.add_argument(
+            "--contact-matching-force-scale",
+            type=float,
+            default=1.0,
+            help="Multiplier for matched previous-step ADMM contact-force warm starts.",
+        )
         parser.add_argument(
             "--proxy-iterations", type=int, default=1, help="Proxy relaxation passes per coupled substep."
         )
