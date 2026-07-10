@@ -5,9 +5,9 @@
 # Example Franka Pulley Mechanical Advantage
 #
 # A MuJoCo-simulated Franka follows an IK trajectory that pulls the free end
-# of a VBD cable. Upper and lower two-sheave crane blocks form a 4:1 tackle
-# that lifts a 5 kg guided weight. The hand approaches and closes on a thin
-# box attached directly to the cable end. SolverCoupledADMM transfers
+# of a VBD cable. Upper and lower multi-sheave crane blocks lift a guided
+# weight with a configurable mechanical advantage. The hand approaches and
+# closes on a thin box attached directly to the cable end. SolverCoupledADMM transfers
 # contact force between the MuJoCo gripper and the VBD mechanism without a
 # fixed robot-cable attachment.
 #
@@ -15,7 +15,7 @@
 # placed on an explicitly pre-wrapped route, following the initialization used
 # by cable_cross_slide_table. The final validation measures cable tension from
 # the axial strain along a straight span clear of pulley contacts and checks the
-# expected 4:1 force advantage.
+# expected force advantage.
 #
 # Command: python -m newton.examples franka_pulley_mechanical_advantage
 #
@@ -36,12 +36,11 @@ import newton.ik as ik
 import newton.utils
 from newton.solvers import SolverMuJoCo, SolverVBD
 
-MECHANICAL_ADVANTAGE = 32.0
-WEIGHT_MASS = 60.0
-END_WEIGHT_MASS = 0.5
-LOAD_WEIGHT_MASS = WEIGHT_MASS + END_WEIGHT_MASS * MECHANICAL_ADVANTAGE
+DEFAULT_MECHANICAL_ADVANTAGE = 4
+DEFAULT_WEIGHT_MASS = 5.0
+END_WEIGHT_MASS = 0.2
 GRAVITY = 9.81
-FRANKA_BASE_X = 1.18
+FRANKA_BASE_X = 1.3
 
 CABLE_RADIUS = 0.004
 CABLE_SEGMENT_LENGTH = 0.020
@@ -69,19 +68,14 @@ PULLEY_WRAP_CLEARANCE = 1.1 * CABLE_RADIUS
 PULLEY_WRAP_RADIUS = PULLEY_RADIUS + PULLEY_WRAP_CLEARANCE
 PULLEY_FIXED_Z = 1.10
 PULLEY_MOVING_Z = 0.72
-PULLEY_PAIR_COUNT = int(MECHANICAL_ADVANTAGE / 2.0)
 PULLEY_BLOCK_X = 0.50
 PULLEY_LEAD_X = PULLEY_BLOCK_X + 3.0 * PULLEY_WRAP_RADIUS
 PULL_X = PULLEY_LEAD_X + PULLEY_WRAP_RADIUS
 PULLEY_SHEAVE_SPACING = 5.5 * CABLE_RADIUS
-PULLEY_SHEAVE_Y = tuple(
-    (index - 0.5 * (PULLEY_PAIR_COUNT - 1)) * PULLEY_SHEAVE_SPACING for index in range(PULLEY_PAIR_COUNT)
-)
-PULL_Y = PULLEY_SHEAVE_Y[-1]
 
 PULL_START_Z = 0.48
-PULL_DISTANCE = 0.22
-GRIPPER_APPROACH_ANGLE = math.pi / 6.0
+PULL_DISTANCE = 0.4
+GRIPPER_APPROACH_ANGLE = 0.0  # math.pi / 6.0
 GRIPPER_GRASP_POSITION = (0.555, 0.0, 0.437)
 
 INITIAL_HOLD_DURATION = 0.0
@@ -421,6 +415,12 @@ class Example:
         self.sim_dt = self.frame_dt / self.sim_substeps
         self.use_graph = bool(args.graph_capture)
         self.coupling_solver = str(args.coupling_solver)
+        self.mechanical_advantage = int(args.mechanical_advantage)
+        if self.mechanical_advantage < 4 or self.mechanical_advantage % 2 != 0:
+            raise ValueError("Mechanical advantage must be an even integer of at least 4")
+        self.weight_mass = float(args.weight_mass)
+        if self.weight_mass <= 0.0:
+            raise ValueError("Weight mass must be positive")
 
         self.pull_target_origin: np.ndarray | None = None
         self.latest_tension = 0.0
@@ -528,6 +528,13 @@ class Example:
         vbd_shape_start = builder.shape_count
         vbd_joints: list[int] = []
 
+        pulley_pair_count = self.mechanical_advantage // 2
+        pulley_sheave_y = tuple(
+            (index - 0.5 * (pulley_pair_count - 1)) * PULLEY_SHEAVE_SPACING for index in range(pulley_pair_count)
+        )
+        pulley_block_half_y = 0.5 * pulley_pair_count * PULLEY_SHEAVE_SPACING
+        pull_y = pulley_sheave_y[-1]
+
         frame_color = (0.16, 0.22, 0.30)
         _add_visual_box(
             builder,
@@ -535,7 +542,7 @@ class Example:
             center=wp.vec3(0.5 * (PULLEY_BLOCK_X + PULL_X), 0.0, PULLEY_FIXED_Z + 0.09),
             half_extents=(
                 0.5 * (PULL_X - PULLEY_BLOCK_X) + 0.08,
-                0.08,
+                pulley_block_half_y + 0.03,
                 0.025,
             ),
             color=frame_color,
@@ -544,11 +551,12 @@ class Example:
 
         load_center = wp.vec3(PULLEY_BLOCK_X, 0.0, 0.49)
         load_half_x = 0.085
+        weight_half_y = max(0.06, pulley_block_half_y + 0.02)
         _add_visual_box(
             builder,
             body=-1,
             center=wp.vec3(float(load_center[0]), 0.0, 0.39),
-            half_extents=(0.14, 0.12, 0.01),
+            half_extents=(0.14, weight_half_y + 0.06, 0.01),
             color=(0.24, 0.27, 0.30),
             label="weight_floor",
             collision=True,
@@ -557,14 +565,14 @@ class Example:
             xform=wp.transform(load_center, wp.quat_identity()),
             label="load_weight_body",
         )
-        weight_half_extents = (load_half_x, 0.06, 0.09)
+        weight_half_extents = (load_half_x, weight_half_y, 0.09)
         weight_volume = 8.0 * math.prod(weight_half_extents)
         _add_visual_box(
             builder,
             body=self.weight_body,
             center=wp.vec3(0.0),
             half_extents=weight_half_extents,
-            density=LOAD_WEIGHT_MASS / weight_volume,
+            density=(self.weight_mass + END_WEIGHT_MASS * self.mechanical_advantage) / weight_volume,
             collision=True,
             color=(0.72, 0.16, 0.12),
             label="load_weight",
@@ -582,9 +590,9 @@ class Example:
 
         moving_color = (0.88, 0.54, 0.12)
         fixed_color = (0.12, 0.38, 0.78)
-        moving_centers = [wp.vec3(PULLEY_BLOCK_X, y, PULLEY_MOVING_Z) for y in PULLEY_SHEAVE_Y]
-        fixed_centers = [wp.vec3(PULLEY_BLOCK_X, y, PULLEY_FIXED_Z) for y in PULLEY_SHEAVE_Y]
-        lead_center = wp.vec3(PULLEY_LEAD_X, PULL_Y, PULLEY_FIXED_Z)
+        moving_centers = [wp.vec3(PULLEY_BLOCK_X, y, PULLEY_MOVING_Z) for y in pulley_sheave_y]
+        fixed_centers = [wp.vec3(PULLEY_BLOCK_X, y, PULLEY_FIXED_Z) for y in pulley_sheave_y]
+        lead_center = wp.vec3(PULLEY_LEAD_X, pull_y, PULLEY_FIXED_Z)
 
         moving_bodies = []
         moving_joints = []
@@ -639,7 +647,7 @@ class Example:
 
         self.lifted_mass = sum(float(builder.body_mass[body]) for body in [self.weight_body, *moving_bodies])
 
-        pull_end = wp.vec3(PULL_X, PULL_Y, PULL_START_Z + END_WEIGHT_INITIAL_OFFSET)
+        pull_end = wp.vec3(PULL_X, pull_y, PULL_START_Z + END_WEIGHT_INITIAL_OFFSET)
         cable_points, route_segment_length = create_block_and_tackle_cable_points(
             moving_centers,
             fixed_centers,
@@ -1092,21 +1100,23 @@ class Example:
         load_lift = final_load_z - self.initial_load_z
         measured_tension = self.latest_tension
         lifted_force = self.lifted_mass * GRAVITY
-        expected_tension = lifted_force / MECHANICAL_ADVANTAGE
+        expected_tension = lifted_force / self.mechanical_advantage
         force_ratio = lifted_force / max(measured_tension, 1.0e-8)
+        minimum_load_lift = 0.6 * PULL_DISTANCE / self.mechanical_advantage
 
-        if load_lift < 0.035:
+        if load_lift < minimum_load_lift:
             raise ValueError(
-                f"The {WEIGHT_MASS:.0f} kg weight lifted only {load_lift:.3f} m; expected at least 0.035 m"
+                f"The {self.weight_mass:.0f} kg weight lifted only {load_lift:.3f} m; "
+                f"expected at least {minimum_load_lift:.3f} m"
             )
         if not math.isclose(measured_tension, expected_tension, rel_tol=0.15):
             raise ValueError(
                 f"Robot cable force is {measured_tension:.2f} N; expected {expected_tension:.2f} N "
-                f"for an {MECHANICAL_ADVANTAGE:.0f}:1 lift"
+                f"for a {self.mechanical_advantage}:1 lift"
             )
-        if not 0.85 * MECHANICAL_ADVANTAGE <= force_ratio <= 1.15 * MECHANICAL_ADVANTAGE:
+        if not 0.85 * self.mechanical_advantage <= force_ratio <= 1.15 * self.mechanical_advantage:
             raise ValueError(
-                f"Measured force advantage is {force_ratio:.2f}; expected approximately {MECHANICAL_ADVANTAGE:.1f}"
+                f"Measured force advantage is {force_ratio:.2f}; expected approximately {self.mechanical_advantage}:1"
             )
         if self.coupling_solver == "admm":
             expected_robot_force = expected_tension - END_WEIGHT_MASS * GRAVITY
@@ -1122,6 +1132,18 @@ class Example:
     def create_parser():
         parser = newton.examples.create_parser()
         newton.examples.add_coupled_view_args(parser)
+        parser.add_argument(
+            "--mechanical-advantage",
+            type=int,
+            default=DEFAULT_MECHANICAL_ADVANTAGE,
+            help="Even supporting-strand count (minimum 4).",
+        )
+        parser.add_argument(
+            "--weight-mass",
+            type=float,
+            default=DEFAULT_WEIGHT_MASS,
+            help="Intended lifted mass before cable-end compensation [kg].",
+        )
         parser.add_argument("--substeps", type=int, default=16, help="Coupled substeps per rendered frame.")
         parser.add_argument(
             "--coupling-solver",
