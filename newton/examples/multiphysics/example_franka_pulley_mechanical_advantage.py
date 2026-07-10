@@ -5,9 +5,9 @@
 # Example Franka Pulley Mechanical Advantage
 #
 # A MuJoCo-simulated Franka follows an IK trajectory that pulls the free end
-# of a VBD cable. Two moving and two fixed VBD pulleys form a 4:1 block and
-# tackle that lifts a 5 kg guided weight. The hand approaches and closes on
-# a thin box attached directly to the cable end. SolverCoupledADMM transfers
+# of a VBD cable. Upper and lower two-sheave crane blocks form a 4:1 tackle
+# that lifts a 5 kg guided weight. The hand approaches and closes on a thin
+# box attached directly to the cable end. SolverCoupledADMM transfers
 # contact force between the MuJoCo gripper and the VBD mechanism without a
 # fixed robot-cable attachment.
 #
@@ -36,9 +36,9 @@ import newton.ik as ik
 import newton.utils
 from newton.solvers import SolverMuJoCo, SolverVBD
 
-MECHANICAL_ADVANTAGE = 4.0
-WEIGHT_MASS = 5.0
-END_WEIGHT_MASS = 0.1
+MECHANICAL_ADVANTAGE = 32.0
+WEIGHT_MASS = 60.0
+END_WEIGHT_MASS = 0.5
 LOAD_WEIGHT_MASS = WEIGHT_MASS + END_WEIGHT_MASS * MECHANICAL_ADVANTAGE
 GRAVITY = 9.81
 FRANKA_BASE_X = 1.18
@@ -69,18 +69,20 @@ PULLEY_WRAP_CLEARANCE = 1.1 * CABLE_RADIUS
 PULLEY_WRAP_RADIUS = PULLEY_RADIUS + PULLEY_WRAP_CLEARANCE
 PULLEY_FIXED_Z = 1.10
 PULLEY_MOVING_Z = 0.72
-PULL_X = 0.55
 PULLEY_PAIR_COUNT = int(MECHANICAL_ADVANTAGE / 2.0)
-PULLEY_MOVING_X = tuple(
-    PULL_X - (4.0 * (PULLEY_PAIR_COUNT - index) - 1.0) * PULLEY_WRAP_RADIUS for index in range(PULLEY_PAIR_COUNT)
+PULLEY_BLOCK_X = 0.50
+PULLEY_LEAD_X = PULLEY_BLOCK_X + 3.0 * PULLEY_WRAP_RADIUS
+PULL_X = PULLEY_LEAD_X + PULLEY_WRAP_RADIUS
+PULLEY_SHEAVE_SPACING = 5.5 * CABLE_RADIUS
+PULLEY_SHEAVE_Y = tuple(
+    (index - 0.5 * (PULLEY_PAIR_COUNT - 1)) * PULLEY_SHEAVE_SPACING for index in range(PULLEY_PAIR_COUNT)
 )
-PULLEY_FIXED_X = tuple(x + 2.0 * PULLEY_WRAP_RADIUS for x in PULLEY_MOVING_X)
+PULL_Y = PULLEY_SHEAVE_Y[-1]
 
 PULL_START_Z = 0.48
 PULL_DISTANCE = 0.22
 GRIPPER_APPROACH_ANGLE = math.pi / 6.0
 GRIPPER_GRASP_POSITION = (0.555, 0.0, 0.437)
-PULL_Y = 0.0
 
 INITIAL_HOLD_DURATION = 0.0
 APPROACH_DURATION = 1.2
@@ -246,38 +248,48 @@ def _resample_equal_length_segments(route_points: list[wp.vec3], segment_length:
 def create_block_and_tackle_cable_points(
     moving_centers: list[wp.vec3],
     fixed_centers: list[wp.vec3],
+    lead_center: wp.vec3,
     pull_end: wp.vec3,
     segment_length: float,
 ) -> tuple[list[wp.vec3], float]:
-    """Create the pre-wrapped route for an even supporting-strand tackle."""
+    """Create the pre-wrapped route through upper and lower crane blocks."""
+    # Keep the dead end below the upper block so it does not touch an unused sheave.
     start = wp.vec3(
-        float(moving_centers[0][0]) - PULLEY_WRAP_RADIUS,
+        float(moving_centers[0][0]) + PULLEY_WRAP_RADIUS,
         float(moving_centers[0][1]),
-        float(fixed_centers[0][2]),
+        float(fixed_centers[0][2]) - 2.0 * PULLEY_WRAP_RADIUS,
     )
     points = [start]
 
-    # Each moving sheave receives two upward tension forces before the cable
-    # exits the final fixed sheave toward the robot.
-    for moving_center, fixed_center in zip(moving_centers, fixed_centers, strict=True):
+    for index, (moving_center, fixed_center) in enumerate(zip(moving_centers, fixed_centers, strict=True)):
         _append_arc_xz(
             points,
             moving_center,
             PULLEY_WRAP_RADIUS,
-            math.pi,
-            2.0 * math.pi,
+            0.0,
+            -math.pi,
             segment_length,
-            direction="ccw",
+            direction="cw",
         )
         _append_arc_xz(
             points,
             fixed_center,
             PULLEY_WRAP_RADIUS,
             math.pi,
-            0.0,
+            0.0 if index < len(fixed_centers) - 1 else 0.5 * math.pi,
             segment_length,
             direction="cw",
         )
+
+    _append_arc_xz(
+        points,
+        lead_center,
+        PULLEY_WRAP_RADIUS,
+        0.5 * math.pi,
+        0.0,
+        segment_length,
+        direction="cw",
+    )
     _append_route_point(points, pull_end)
     return _resample_equal_length_segments(points, segment_length)
 
@@ -396,22 +408,6 @@ def add_pulley(
             label=f"{label}_{suffix}",
         )
 
-    marker_cfg = newton.ModelBuilder.ShapeConfig(
-        density=0.0,
-        has_shape_collision=False,
-        has_particle_collision=False,
-    )
-    builder.add_shape_sphere(
-        body=body,
-        xform=wp.transform(
-            wp.vec3(0.78 * PULLEY_RADIUS, groove_half_width + 2.0 * flange_half_thickness, 0.0),
-            wp.quat_identity(),
-        ),
-        radius=0.75 * CABLE_RADIUS,
-        cfg=marker_cfg,
-        color=(0.96, 0.92, 0.72),
-        label=f"{label}_rotation_dot",
-    )
     return body, joint
 
 
@@ -536,13 +532,17 @@ class Example:
         _add_visual_box(
             builder,
             body=-1,
-            center=wp.vec3(0.5 * (PULLEY_MOVING_X[0] + PULL_X), 0.09, 1.10),
-            half_extents=(0.5 * (PULL_X - PULLEY_MOVING_X[0]) + 0.07, 0.025, 0.025),
+            center=wp.vec3(0.5 * (PULLEY_BLOCK_X + PULL_X), 0.0, PULLEY_FIXED_Z + 0.09),
+            half_extents=(
+                0.5 * (PULL_X - PULLEY_BLOCK_X) + 0.08,
+                0.08,
+                0.025,
+            ),
             color=frame_color,
             label="pulley_frame_top_beam",
         )
 
-        load_center = wp.vec3(0.5 * (PULLEY_MOVING_X[0] + PULLEY_MOVING_X[-1]), 0.0, 0.49)
+        load_center = wp.vec3(PULLEY_BLOCK_X, 0.0, 0.49)
         load_half_x = 0.085
         _add_visual_box(
             builder,
@@ -582,8 +582,9 @@ class Example:
 
         moving_color = (0.88, 0.54, 0.12)
         fixed_color = (0.12, 0.38, 0.78)
-        moving_centers = [wp.vec3(x, 0.0, PULLEY_MOVING_Z) for x in PULLEY_MOVING_X]
-        fixed_centers = [wp.vec3(x, 0.0, PULLEY_FIXED_Z) for x in PULLEY_FIXED_X]
+        moving_centers = [wp.vec3(PULLEY_BLOCK_X, y, PULLEY_MOVING_Z) for y in PULLEY_SHEAVE_Y]
+        fixed_centers = [wp.vec3(PULLEY_BLOCK_X, y, PULLEY_FIXED_Z) for y in PULLEY_SHEAVE_Y]
+        lead_center = wp.vec3(PULLEY_LEAD_X, PULL_Y, PULLEY_FIXED_Z)
 
         moving_bodies = []
         moving_joints = []
@@ -601,9 +602,10 @@ class Example:
             moving_joints.append(joint)
             vbd_joints.append(joint)
 
+        fixed_bodies = []
         fixed_joints = []
         for index, center in enumerate(fixed_centers):
-            _, joint = add_pulley(
+            body, joint = add_pulley(
                 builder,
                 center=center,
                 parent=-1,
@@ -612,11 +614,28 @@ class Example:
                 label=f"fixed_pulley_{index}",
                 density=1.0e-1,
             )
+            fixed_bodies.append(body)
             fixed_joints.append(joint)
             vbd_joints.append(joint)
+
+        lead_body, lead_joint = add_pulley(
+            builder,
+            center=lead_center,
+            parent=-1,
+            parent_origin=wp.vec3(0.0),
+            color=fixed_color,
+            label="lead_pulley",
+            density=1.0e-1,
+        )
+        fixed_bodies.append(lead_body)
+        vbd_joints.append(lead_joint)
+
+        _filter_body_group_collisions(builder, moving_bodies)
+        _filter_body_group_collisions(builder, fixed_bodies)
         builder.add_articulation([load_slide, *moving_joints], label="moving_pulley_block")
         for index, joint in enumerate(fixed_joints):
             builder.add_articulation([joint], label=f"fixed_pulley_{index}_articulation")
+        builder.add_articulation([lead_joint], label="lead_pulley_articulation")
 
         self.lifted_mass = sum(float(builder.body_mass[body]) for body in [self.weight_body, *moving_bodies])
 
@@ -624,6 +643,7 @@ class Example:
         cable_points, route_segment_length = create_block_and_tackle_cable_points(
             moving_centers,
             fixed_centers,
+            lead_center,
             pull_end,
             CABLE_SEGMENT_LENGTH,
         )
@@ -745,7 +765,7 @@ class Example:
         self.model.shape_material_kd.assign(shape_kd)
         self.model.shape_material_mu.assign(shape_mu)
 
-        tension_span_x = float(cable_points[0][0])
+        tension_span_x = PULL_X
         tension_span_z_min = PULLEY_MOVING_Z + 2.0 * PULLEY_WRAP_RADIUS
         tension_span_z_max = PULLEY_FIXED_Z - 2.0 * PULLEY_WRAP_RADIUS
         self.cable_tension_joints = [
