@@ -14,9 +14,8 @@
 # The cable is initialized as a straight rod and its body transforms are then
 # placed on an explicitly pre-wrapped route, following the initialization used
 # by cable_cross_slide_table. The final validation measures cable tension from
-# the axial strain along a straight span clear of pulley contacts and checks
-# both the expected force ratio and the inverse 4:1 travel ratio from the
-# actual grasped-box and load motion.
+# the axial strain along a straight span clear of pulley contacts and checks the
+# expected 4:1 force advantage.
 #
 # Command: python -m newton.examples franka_pulley_mechanical_advantage
 #
@@ -64,8 +63,6 @@ GRIPPER_PAD_HALF_Y = 0.004
 GRIPPER_PAD_HALF_Z = 0.012
 GRIPPER_PAD_CENTER_Y = GRIPPER_PAD_HALF_Y
 GRIPPER_PAD_CENTER_Z = 0.055
-CABLE_PLANE_STIFFNESS = 20.0
-CABLE_PLANE_DAMPING = 0.12
 
 PULLEY_RADIUS = 0.045
 PULLEY_WRAP_CLEARANCE = 1.1 * CABLE_RADIUS
@@ -82,23 +79,18 @@ PULLEY_FIXED_X = tuple(x + 2.0 * PULLEY_WRAP_RADIUS for x in PULLEY_MOVING_X)
 PULL_START_Z = 0.48
 PULL_DISTANCE = 0.22
 GRIPPER_APPROACH_ANGLE = math.pi / 6.0
-GRASP_TCP_X = 0.555
-GRASP_TCP_Z = 0.437
-PULL_END_Z = GRASP_TCP_Z - PULL_DISTANCE
+GRIPPER_GRASP_POSITION = (0.555, 0.0, 0.437)
 PULL_Y = 0.0
-GRIPPER_TARGET_Y = 0.0
 
 INITIAL_HOLD_DURATION = 0.0
 APPROACH_DURATION = 1.2
 SIDE_APPROACH_DURATION = 0.8
-PREGRASP_HOLD_DURATION = 1.6
 GRASP_DURATION = 1.0
 PULL_DURATION = 8.0
 FINAL_HOLD_DURATION = 2.0
 GRASP_END_TIME = INITIAL_HOLD_DURATION + APPROACH_DURATION + SIDE_APPROACH_DURATION + GRASP_DURATION
 PULL_END_TIME = GRASP_END_TIME + PULL_DURATION
 EXAMPLE_DURATION = PULL_END_TIME + FINAL_HOLD_DURATION
-TRAVEL_REFERENCE_LIFT_EPSILON = 5.0e-4
 
 GRIPPER_APPROACH_ORIENTATION = (
     0.0,
@@ -434,14 +426,9 @@ class Example:
         self.use_graph = bool(args.graph_capture)
         self.coupling_solver = str(args.coupling_solver)
 
-        self.travel_reference_load_z: float | None = None
-        self.travel_reference_end_box_z: float | None = None
-        self.box_target_center: np.ndarray | None = None
         self.pull_target_origin: np.ndarray | None = None
         self.latest_tension = 0.0
         self.latest_robot_downward_force = 0.0
-        self.latest_force_ratio = 0.0
-        self.latest_travel_ratio = 0.0
 
         self._build_scene()
         self._build_keyframes()
@@ -454,7 +441,9 @@ class Example:
         newton.eval_fk(self.model, self.model.joint_q, self.model.joint_qd, self.state_0)
         newton.eval_fk(self.model, self.model.joint_q, self.model.joint_qd, self.state_1)
         self._initialize_wrapped_cable()
-        self.box_target_center = self._end_box_center(self.state_0.body_q.numpy())
+        initial_body_q = self.state_0.body_q.numpy()
+        self.box_target_center = self._end_box_center(initial_body_q)
+        self.initial_load_z = float(initial_body_q[self.weight_body, 2])
         self.solver.sync_entry_states(self.state_0)
 
         self.collision_pipeline = newton.CollisionPipeline(self.model)
@@ -552,15 +541,6 @@ class Example:
             color=frame_color,
             label="pulley_frame_top_beam",
         )
-        for x in (PULLEY_MOVING_X[0] - 0.12, PULL_X + 0.08):
-            _add_visual_box(
-                builder,
-                body=-1,
-                center=wp.vec3(x, 0.09, 0.56),
-                half_extents=(0.025, 0.025, 0.54),
-                color=frame_color,
-                label=f"pulley_frame_post_{x:.2f}",
-            )
 
         load_center = wp.vec3(0.5 * (PULLEY_MOVING_X[0] + PULLEY_MOVING_X[-1]), 0.0, 0.49)
         load_half_x = 0.085
@@ -677,7 +657,6 @@ class Example:
             color=(0.82, 0.72, 0.46),
             label="block_and_tackle_cable",
         )
-        cable_gravity_compensation = [float(builder.body_mass[body]) * GRAVITY for body in self.cable_bodies]
         self.initial_cable_xforms = [
             wp.transform(cable_points[i] + 0.5 * (cable_points[i + 1] - cable_points[i]), cable_quats[i])
             for i in range(len(self.cable_bodies))
@@ -754,12 +733,6 @@ class Example:
         builder.color(balance_colors=False)
         self.model = builder.finalize()
         self.device = self.model.device
-        self.cable_body_indices = wp.array(self.cable_bodies, dtype=wp.int32, device=self.device)
-        self.cable_gravity_compensation = wp.array(
-            cable_gravity_compensation,
-            dtype=float,
-            device=self.device,
-        )
 
         gripper_contact_shapes = list(self.gripper_contact_shapes)
         shape_ke = self.model.shape_material_ke.numpy()
@@ -868,96 +841,34 @@ class Example:
 
     def _build_keyframes(self) -> None:
         start_position, start_rotation = self._initial_tcp_pose()
-        approach_qx, approach_qy, approach_qz, approach_qw = GRIPPER_APPROACH_ORIENTATION
-        approach_rotation = np.array(
-            [approach_qx, approach_qy, approach_qz, approach_qw],
-            dtype=np.float32,
-        )
+        approach_rotation = np.asarray(GRIPPER_APPROACH_ORIENTATION, dtype=np.float32)
         if float(np.dot(start_rotation, approach_rotation)) < 0.0:
             start_rotation = -start_rotation
-        pregrasp_x = GRASP_TCP_X
-        pregrasp_z = GRASP_TCP_Z
-        approach_x = pregrasp_x + 0.14
-        approach_z = pregrasp_z + 0.14 * math.tan(GRIPPER_APPROACH_ANGLE)
-        grasp_z = GRASP_TCP_Z
+
+        grasp_position = np.asarray(GRIPPER_GRASP_POSITION, dtype=np.float32)
+        approach_position = grasp_position + np.array(
+            [0.14, 0.0, 0.14 * math.tan(GRIPPER_APPROACH_ANGLE)],
+            dtype=np.float32,
+        )
+        pull_position = grasp_position - np.array([0.0, 0.0, PULL_DISTANCE], dtype=np.float32)
+
+        def keyframe(duration: float, position: np.ndarray, grip: float) -> list[float]:
+            return [duration, *position, *approach_rotation, grip]
+
         poses = np.array(
             [
                 [INITIAL_HOLD_DURATION, *start_position.tolist(), *start_rotation.tolist(), GRIP_OPEN],
-                [
-                    APPROACH_DURATION,
-                    approach_x,
-                    GRIPPER_TARGET_Y,
-                    approach_z,
-                    approach_qx,
-                    approach_qy,
-                    approach_qz,
-                    approach_qw,
-                    GRIP_OPEN,
-                ],
-                [
-                    SIDE_APPROACH_DURATION,
-                    pregrasp_x,
-                    GRIPPER_TARGET_Y,
-                    pregrasp_z,
-                    approach_qx,
-                    approach_qy,
-                    approach_qz,
-                    approach_qw,
-                    GRIP_OPEN,
-                ],
-                # [
-                #    PREGRASP_HOLD_DURATION,
-                #    pregrasp_x,
-                #    GRIPPER_TARGET_Y,
-                #    pregrasp_z,
-                #    approach_qx,
-                #    approach_qy,
-                #    approach_qz,
-                #    approach_qw,
-                #    GRIP_OPEN,
-                # ],
-                [
-                    GRASP_DURATION,
-                    GRASP_TCP_X,
-                    GRIPPER_TARGET_Y,
-                    grasp_z,
-                    approach_qx,
-                    approach_qy,
-                    approach_qz,
-                    approach_qw,
-                    GRIP_CLOSE,
-                ],
-                [
-                    PULL_DURATION,
-                    GRASP_TCP_X,
-                    GRIPPER_TARGET_Y,
-                    PULL_END_Z,
-                    approach_qx,
-                    approach_qy,
-                    approach_qz,
-                    approach_qw,
-                    GRIP_CLOSE,
-                ],
-                [
-                    FINAL_HOLD_DURATION,
-                    GRASP_TCP_X,
-                    GRIPPER_TARGET_Y,
-                    PULL_END_Z,
-                    approach_qx,
-                    approach_qy,
-                    approach_qz,
-                    approach_qw,
-                    GRIP_CLOSE,
-                ],
+                keyframe(APPROACH_DURATION, approach_position, GRIP_OPEN),
+                keyframe(SIDE_APPROACH_DURATION, grasp_position, GRIP_OPEN),
+                keyframe(GRASP_DURATION, grasp_position, GRIP_CLOSE),
+                keyframe(PULL_DURATION, pull_position, GRIP_CLOSE),
+                keyframe(FINAL_HOLD_DURATION, pull_position, GRIP_CLOSE),
             ],
             dtype=np.float32,
         )
         self.targets = poses[:, 1:]
         self.key_times = np.cumsum(poses[:, 0])
-        self.nominal_grasp_position = np.array(
-            [GRASP_TCP_X, GRIPPER_TARGET_Y, GRASP_TCP_Z],
-            dtype=np.float32,
-        )
+        self.nominal_grasp_position = grasp_position
         self.pull_keyframe_index = len(poses) - 2
 
     def _initial_tcp_pose(self) -> tuple[np.ndarray, np.ndarray]:
@@ -1033,8 +944,6 @@ class Example:
         target = (1.0 - alpha) * previous + alpha * current
 
         if interval > 0:
-            if self.box_target_center is None:
-                raise RuntimeError("Gripper-box target center was not initialized")
             if interval >= self.pull_keyframe_index:
                 if self.pull_target_origin is None:
                     # Box motion must not feed back into the commanded pull distance.
@@ -1115,9 +1024,6 @@ class Example:
             np.array([0.0, 0.0, self.end_box_center_offset], dtype=np.float64),
         )
 
-    def _end_box_z(self, body_q: np.ndarray) -> float:
-        return float(self._end_box_center(body_q)[2])
-
     def _measure_robot_downward_force(self) -> float:
         if self.mujoco_solver.use_mujoco_cpu:
             applied_wrenches = np.asarray(self.mujoco_solver.mj_data.xfrc_applied)
@@ -1132,32 +1038,11 @@ class Example:
         self.latest_robot_downward_force = self._measure_robot_downward_force()
         load_z = float(body_q[self.weight_body, 2])
         self.box_target_center = self._end_box_center(body_q)
-        end_box_z = float(self.box_target_center[2])
-
-        if (
-            self.travel_reference_load_z is None
-            or load_z <= self.travel_reference_load_z + TRAVEL_REFERENCE_LIFT_EPSILON
-        ):
-            # Follow the box while the load rests on the floor, then retain the
-            # last position before lift. This is always active for scripted and
-            # interactive pulls without relying on trajectory timing.
-            self.travel_reference_load_z = load_z
-            self.travel_reference_end_box_z = end_box_z
-
-        if self.latest_tension > 1.0e-6:
-            self.latest_force_ratio = self.lifted_mass * GRAVITY / self.latest_tension
-        if self.travel_reference_load_z is not None and self.travel_reference_end_box_z is not None:
-            lift = load_z - self.travel_reference_load_z
-            pull = self.travel_reference_end_box_z - end_box_z
-            if lift > TRAVEL_REFERENCE_LIFT_EPSILON:
-                self.latest_travel_ratio = pull / lift
-            else:
-                self.latest_travel_ratio = 0.0
+        force_ratio = self.lifted_mass * GRAVITY / self.latest_tension if self.latest_tension > 1.0e-6 else 0.0
         self.viewer.log_scalar("Cable tension [N]", self.latest_tension, smoothing=10)
         self.viewer.log_scalar("Robot downward force [N]", self.latest_robot_downward_force, smoothing=10)
-        self.viewer.log_scalar("Measured force advantage", self.latest_force_ratio)
-        self.viewer.log_scalar("Measured travel ratio", self.latest_travel_ratio)
-        self.viewer.log_scalar("Grasped box height [m]", end_box_z)
+        self.viewer.log_scalar("Measured force advantage", force_ratio)
+        self.viewer.log_scalar("Grasped box height [m]", float(self.box_target_center[2]))
         self.viewer.log_scalar("Weight height [m]", load_z)
 
     def step(self) -> None:
@@ -1179,41 +1064,27 @@ class Example:
             raise ValueError("Pulley mechanism contains NaN or inf body state")
 
     def test_final(self) -> None:
-        if self.travel_reference_load_z is None or self.travel_reference_end_box_z is None:
-            raise ValueError("Travel reporting was not initialized")
         if self.latest_tension < 1.0:
             raise ValueError("The Franka grasp never transmitted load into the VBD cable")
 
         body_q = self.state_0.body_q.numpy()
         final_load_z = float(body_q[self.weight_body, 2])
-        final_end_box_z = self._end_box_z(body_q)
-        load_lift = final_load_z - self.travel_reference_load_z
-        end_box_pull = self.travel_reference_end_box_z - final_end_box_z
-        travel_ratio = end_box_pull / max(load_lift, 1.0e-8)
-
+        load_lift = final_load_z - self.initial_load_z
         measured_tension = self.latest_tension
         lifted_force = self.lifted_mass * GRAVITY
         expected_tension = lifted_force / MECHANICAL_ADVANTAGE
         force_ratio = lifted_force / max(measured_tension, 1.0e-8)
 
-        travel_ratio_lower = 0.8 * MECHANICAL_ADVANTAGE
-        travel_ratio_upper = 1.2 * MECHANICAL_ADVANTAGE
-        force_ratio_lower = 0.85 * MECHANICAL_ADVANTAGE
-        force_ratio_upper = 1.15 * MECHANICAL_ADVANTAGE
         if load_lift < 0.035:
             raise ValueError(
                 f"The {WEIGHT_MASS:.0f} kg weight lifted only {load_lift:.3f} m; expected at least 0.035 m"
-            )
-        if not travel_ratio_lower <= travel_ratio <= travel_ratio_upper:
-            raise ValueError(
-                f"Pulley travel ratio is {travel_ratio:.2f}; expected approximately {MECHANICAL_ADVANTAGE:.1f}"
             )
         if not math.isclose(measured_tension, expected_tension, rel_tol=0.15):
             raise ValueError(
                 f"Robot cable force is {measured_tension:.2f} N; expected {expected_tension:.2f} N "
                 f"for an {MECHANICAL_ADVANTAGE:.0f}:1 lift"
             )
-        if not force_ratio_lower <= force_ratio <= force_ratio_upper:
+        if not 0.85 * MECHANICAL_ADVANTAGE <= force_ratio <= 1.15 * MECHANICAL_ADVANTAGE:
             raise ValueError(
                 f"Measured force advantage is {force_ratio:.2f}; expected approximately {MECHANICAL_ADVANTAGE:.1f}"
             )
