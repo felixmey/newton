@@ -75,7 +75,7 @@ PULLEY_SHEAVE_SPACING = 5.5 * CABLE_RADIUS
 
 PULL_START_Z = 0.48
 PULL_DISTANCE = 0.4
-GRIPPER_APPROACH_ANGLE = 0.0  # math.pi / 6.0
+GRIPPER_APPROACH_ANGLE = math.pi / 6.0
 GRIPPER_GRASP_POSITION = (0.555, 0.0, 0.437)
 
 INITIAL_HOLD_DURATION = 0.0
@@ -328,6 +328,53 @@ def _add_visual_box(
     )
 
 
+def _add_pulley_stack_mount(
+    builder: newton.ModelBuilder,
+    *,
+    body: int,
+    axle_center: wp.vec3,
+    mount_z: float,
+    stack_half_y: float,
+    support_color: tuple[float, float, float],
+    label: str,
+) -> None:
+    """Add a shared axle and two bearing supports to a pulley stack."""
+    axle_radius = 2.0 * CABLE_RADIUS
+    bearing_half_y = 2.0 * CABLE_RADIUS
+    bearing_center_y = stack_half_y + bearing_half_y + 0.002
+    axle_half_height = stack_half_y + 2.0 * bearing_half_y
+    axle_x = float(axle_center[0])
+    axle_y = float(axle_center[1])
+    axle_z = float(axle_center[2])
+    align_cylinder_to_y = wp.quat_from_axis_angle(wp.vec3(1.0, 0.0, 0.0), -0.5 * math.pi)
+    axle_cfg = newton.ModelBuilder.ShapeConfig(
+        density=0.0,
+        has_shape_collision=False,
+        has_particle_collision=False,
+    )
+    builder.add_shape_cylinder(
+        body=body,
+        xform=wp.transform(axle_center, align_cylinder_to_y),
+        radius=axle_radius,
+        half_height=axle_half_height + 0.003,
+        cfg=axle_cfg,
+        color=(0.42, 0.45, 0.48),
+        label=f"{label}_axle",
+    )
+
+    support_center_z = 0.5 * (axle_z + mount_z)
+    support_half_z = 0.5 * abs(mount_z - axle_z) + axle_radius
+    for side, suffix in ((-1.0, "neg"), (1.0, "pos")):
+        _add_visual_box(
+            builder,
+            body=body,
+            center=wp.vec3(axle_x, axle_y + side * bearing_center_y, support_center_z),
+            half_extents=(0.025, bearing_half_y, support_half_z),
+            color=support_color,
+            label=f"{label}_bearing_{suffix}",
+        )
+
+
 def add_pulley(
     builder: newton.ModelBuilder,
     *,
@@ -416,7 +463,7 @@ class Example:
         self.use_graph = bool(args.graph_capture)
         self.coupling_solver = str(args.coupling_solver)
         self.mechanical_advantage = int(args.mechanical_advantage)
-        if self.mechanical_advantage < 4 or self.mechanical_advantage % 2 != 0:
+        if self.mechanical_advantage < 2 or self.mechanical_advantage % 2 != 0:
             raise ValueError("Mechanical advantage must be an even integer of at least 4")
         self.weight_mass = float(args.weight_mass)
         if self.weight_mass <= 0.0:
@@ -536,14 +583,16 @@ class Example:
         pull_y = pulley_sheave_y[-1]
 
         frame_color = (0.16, 0.22, 0.30)
+        top_beam_center_z = PULLEY_FIXED_Z + 0.09
+        top_beam_half_z = 0.025
         _add_visual_box(
             builder,
             body=-1,
-            center=wp.vec3(0.5 * (PULLEY_BLOCK_X + PULL_X), 0.0, PULLEY_FIXED_Z + 0.09),
+            center=wp.vec3(0.5 * (PULLEY_BLOCK_X + PULL_X), 0.0, top_beam_center_z),
             half_extents=(
                 0.5 * (PULL_X - PULLEY_BLOCK_X) + 0.08,
                 pulley_block_half_y + 0.03,
-                0.025,
+                top_beam_half_z,
             ),
             color=frame_color,
             label="pulley_frame_top_beam",
@@ -593,6 +642,35 @@ class Example:
         moving_centers = [wp.vec3(PULLEY_BLOCK_X, y, PULLEY_MOVING_Z) for y in pulley_sheave_y]
         fixed_centers = [wp.vec3(PULLEY_BLOCK_X, y, PULLEY_FIXED_Z) for y in pulley_sheave_y]
         lead_center = wp.vec3(PULLEY_LEAD_X, pull_y, PULLEY_FIXED_Z)
+
+        _add_pulley_stack_mount(
+            builder,
+            body=-1,
+            axle_center=wp.vec3(PULLEY_BLOCK_X, 0.0, PULLEY_FIXED_Z),
+            mount_z=top_beam_center_z - top_beam_half_z,
+            stack_half_y=pulley_block_half_y,
+            support_color=frame_color,
+            label="fixed_pulley_stack",
+        )
+        _add_pulley_stack_mount(
+            builder,
+            body=-1,
+            axle_center=lead_center,
+            mount_z=top_beam_center_z - top_beam_half_z,
+            stack_half_y=0.5 * PULLEY_SHEAVE_SPACING,
+            support_color=frame_color,
+            label="lead_pulley_mount",
+        )
+
+        _add_pulley_stack_mount(
+            builder,
+            body=self.weight_body,
+            axle_center=wp.vec3(0.0, 0.0, PULLEY_MOVING_Z - float(load_center[2])),
+            mount_z=weight_half_extents[2],
+            stack_half_y=pulley_block_half_y,
+            support_color=(0.50, 0.18, 0.12),
+            label="moving_pulley_stack",
+        )
 
         moving_bodies = []
         moving_joints = []
@@ -1062,16 +1140,21 @@ class Example:
 
     def _record_diagnostics(self) -> None:
         body_q = self.state_0.body_q.numpy()
-        self.latest_tension = self._measure_cable_tension(body_q)
+        # self.latest_tension = self._measure_cable_tension(body_q)
         self.latest_robot_downward_force = self._measure_robot_downward_force()
         load_z = float(body_q[self.weight_body, 2])
         self.box_target_center = self._end_box_center(body_q)
-        force_ratio = self.lifted_mass * GRAVITY / self.latest_tension if self.latest_tension > 1.0e-6 else 0.0
-        self.viewer.log_scalar("Cable tension [N]", self.latest_tension, smoothing=10)
+
+        force_ratio = (
+            self.weight_mass * GRAVITY / self.latest_robot_downward_force
+            if self.latest_robot_downward_force > 1.0e-6
+            else 0.0
+        )
+        # self.viewer.log_scalar("Cable tension [N]", self.latest_tension, smoothing=10)
         self.viewer.log_scalar("Robot downward force [N]", self.latest_robot_downward_force, smoothing=10)
-        self.viewer.log_scalar("Measured force advantage", force_ratio)
-        self.viewer.log_scalar("Grasped box height [m]", float(self.box_target_center[2]))
-        self.viewer.log_scalar("Weight height [m]", load_z)
+        self.viewer.log_scalar("Measured force advantage", force_ratio, smoothing=10)
+        self.viewer.log_scalar("Grasped box height [m]", float(self.box_target_center[2]), smoothing=10)
+        self.viewer.log_scalar("Weight height [m]", load_z, smoothing=10)
 
     def step(self) -> None:
         self.update_ik_target()
