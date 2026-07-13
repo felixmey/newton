@@ -44,10 +44,6 @@ FRANKA_BASE_X = 1.3
 
 CABLE_RADIUS = 0.004
 CABLE_SEGMENT_LENGTH = 0.020
-# CABLE_STRETCH_STIFFNESS = 1.0e5
-# CABLE_STRETCH_DAMPING = 1.0e-4
-# CABLE_BEND_STIFFNESS = 1.0e-2
-# CABLE_BEND_DAMPING = 5.0e-5
 CABLE_STRETCH_STIFFNESS = None  # 1.0e5
 CABLE_STRETCH_DAMPING = None  # 1.0e-4
 CABLE_BEND_STIFFNESS = None  # 1.0e-2
@@ -56,16 +52,13 @@ CABLE_PULLEY_FRICTION = 0.1
 CABLE_CONTACT_GAP = 0.5 * CABLE_RADIUS
 END_WEIGHT_INITIAL_OFFSET = 0.020
 END_BOX_HALF_X = 0.025
-END_BOX_HALF_Y = 0.008
+END_BOX_HALF_Y = 0.025
 END_BOX_HALF_Z = 0.050
 GRIPPER_FRICTION = 8.0
 GRIPPER_CONTACT_STIFFNESS = 2.0e4
 GRIPPER_CONTACT_DAMPING = 50.0
-GRIPPER_PAD_HALF_X = 0.010
-GRIPPER_PAD_HALF_Y = 0.004
-GRIPPER_PAD_HALF_Z = 0.012
-GRIPPER_PAD_CENTER_Y = GRIPPER_PAD_HALF_Y
-GRIPPER_PAD_CENTER_Z = 0.055
+GRIPPER_HEIGHT_CORRECTION_FILTER = 0.2
+GRIPPER_HEIGHT_CORRECTION_MAX = 0.06
 
 PULLEY_RADIUS = 0.045
 PULLEY_WRAP_CLEARANCE = 1.2 * CABLE_RADIUS
@@ -476,6 +469,8 @@ class Example:
         self.pull_target_origin: np.ndarray | None = None
         self.latest_tension = 0.0
         self.latest_robot_downward_force = 0.0
+        self.gripper_height_correction = 0.0
+        self.last_commanded_tcp_z = 0.0
 
         self._build_scene()
         self._build_keyframes()
@@ -490,6 +485,8 @@ class Example:
         self._initialize_wrapped_cable()
         initial_body_q = self.state_0.body_q.numpy()
         self.box_target_center = self._end_box_center(initial_body_q)
+        self.gripper_pad_midpoint = self._gripper_pad_midpoint(initial_body_q)
+        self.last_commanded_tcp_z = float(self.targets[0, 2])
         self.initial_load_z = float(initial_body_q[self.weight_body, 2])
         self.solver.sync_entry_states(self.state_0)
 
@@ -521,31 +518,10 @@ class Example:
         builder.joint_q[: len(FRANKA_Q)] = FRANKA_Q
         builder.joint_target_q[: len(FRANKA_Q)] = FRANKA_Q
 
-        pad_cfg = newton.ModelBuilder.ShapeConfig(
-            density=0.0,
-            ke=GRIPPER_CONTACT_STIFFNESS,
-            kd=GRIPPER_CONTACT_DAMPING,
-            mu=GRIPPER_FRICTION,
-            gap=0.002,
-            is_visible=False,
-        )
         for finger_label in ("fr3_leftfinger", "fr3_rightfinger"):
             finger_body = _find_label_index(builder.body_label, finger_label)
-            stock_rubber_shape = int(builder.body_shapes[finger_body][-1])
-            builder.shape_label[stock_rubber_shape] = f"{finger_label}_rubber_contact_pad"
-            builder.add_shape_box(
-                body=finger_body,
-                xform=wp.transform(
-                    wp.vec3(0.0, GRIPPER_PAD_CENTER_Y, GRIPPER_PAD_CENTER_Z),
-                    wp.quat_identity(),
-                ),
-                hx=GRIPPER_PAD_HALF_X,
-                hy=GRIPPER_PAD_HALF_Y,
-                hz=GRIPPER_PAD_HALF_Z,
-                cfg=pad_cfg,
-                color=(0.12, 0.12, 0.14),
-                label=f"{finger_label}_extended_contact_pad",
-            )
+            rubber_pad_shape = int(builder.body_shapes[finger_body][-1])
+            builder.shape_label[rubber_pad_shape] = f"{finger_label}_rubber_contact_pad"
 
     def _build_scene(self) -> None:
         builder = newton.ModelBuilder(gravity=-GRAVITY)
@@ -568,12 +544,6 @@ class Example:
         self.franka_joints = list(range(franka_joint_start, builder.joint_count))
         self.franka_shapes = list(range(franka_shape_start, builder.shape_count))
         self.hand_body = _find_label_index(builder.body_label, "fr3_hand")
-
-        gravcomp = builder.custom_attributes["mujoco:gravcomp"]
-        if gravcomp.values is None:
-            gravcomp.values = {}
-        for body in self.franka_bodies:
-            gravcomp.values[body] = 1.0
 
         vbd_body_start = builder.body_count
         vbd_shape_start = builder.shape_count
@@ -842,6 +812,15 @@ class Example:
 
         builder.color(balance_colors=False)
         self.model = builder.finalize()
+        shape_body = self.model.shape_body.numpy()
+        shape_transform = self.model.shape_transform.numpy()
+        self.gripper_pad_local_centers = tuple(
+            (
+                int(shape_body[shape]),
+                np.asarray(shape_transform[shape, :3], dtype=np.float64),
+            )
+            for shape in sorted(self.gripper_contact_shapes)
+        )
         self.device = self.model.device
 
         gripper_contact_shapes = list(self.gripper_contact_shapes)
@@ -1070,6 +1049,20 @@ class Example:
                 previous_position = previous[:3] + center_offset
             target[:3] = (1.0 - alpha) * previous_position + alpha * current_position
 
+            if interval < self.pull_keyframe_index:
+                measured_offset = self.last_commanded_tcp_z - float(self.gripper_pad_midpoint[2])
+                self.gripper_height_correction = float(
+                    np.clip(
+                        (1.0 - GRIPPER_HEIGHT_CORRECTION_FILTER) * self.gripper_height_correction
+                        + GRIPPER_HEIGHT_CORRECTION_FILTER * measured_offset,
+                        0.0,
+                        GRIPPER_HEIGHT_CORRECTION_MAX,
+                    )
+                )
+            target[2] += self.gripper_height_correction
+
+        self.last_commanded_tcp_z = float(target[2])
+
         wp.launch(
             set_task_target,
             dim=1,
@@ -1134,6 +1127,15 @@ class Example:
             np.array([0.0, 0.0, self.end_box_center_offset], dtype=np.float64),
         )
 
+    def _gripper_pad_midpoint(self, body_q: np.ndarray) -> np.ndarray:
+        return np.mean(
+            [
+                self._transform_point(body_q[body], local_center)
+                for body, local_center in self.gripper_pad_local_centers
+            ],
+            axis=0,
+        )
+
     def _measure_robot_downward_force(self) -> float:
         if self.mujoco_solver.use_mujoco_cpu:
             applied_wrenches = np.asarray(self.mujoco_solver.mj_data.xfrc_applied)
@@ -1148,6 +1150,7 @@ class Example:
         self.latest_robot_downward_force = self._measure_robot_downward_force()
         load_z = float(body_q[self.weight_body, 2])
         self.box_target_center = self._end_box_center(body_q)
+        self.gripper_pad_midpoint = self._gripper_pad_midpoint(body_q)
 
         force_ratio = (
             self.weight_mass * GRAVITY / self.latest_robot_downward_force
@@ -1157,6 +1160,7 @@ class Example:
         # self.viewer.log_scalar("Cable tension [N]", self.latest_tension, smoothing=10)
         self.viewer.log_scalar("Robot downward force [N]", self.latest_robot_downward_force, smoothing=10)
         self.viewer.log_scalar("Measured force advantage", force_ratio, smoothing=10)
+        self.viewer.log_scalar("Gripper height correction [m]", self.gripper_height_correction, smoothing=10)
         self.viewer.log_scalar("Grasped box height [m]", float(self.box_target_center[2]), smoothing=10)
         self.viewer.log_scalar("Weight height [m]", load_z, smoothing=10)
 
