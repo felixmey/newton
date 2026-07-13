@@ -44,10 +44,14 @@ FRANKA_BASE_X = 1.3
 
 CABLE_RADIUS = 0.004
 CABLE_SEGMENT_LENGTH = 0.020
-CABLE_STRETCH_STIFFNESS = 1.0e5
-CABLE_STRETCH_DAMPING = 1.0e-4
-CABLE_BEND_STIFFNESS = 1.0e-2
-CABLE_BEND_DAMPING = 5.0e-5
+# CABLE_STRETCH_STIFFNESS = 1.0e5
+# CABLE_STRETCH_DAMPING = 1.0e-4
+# CABLE_BEND_STIFFNESS = 1.0e-2
+# CABLE_BEND_DAMPING = 5.0e-5
+CABLE_STRETCH_STIFFNESS = None  # 1.0e5
+CABLE_STRETCH_DAMPING = None  # 1.0e-4
+CABLE_BEND_STIFFNESS = None  # 1.0e-2
+CABLE_BEND_DAMPING = None  # 5.0e-5
 CABLE_PULLEY_FRICTION = 0.1
 CABLE_CONTACT_GAP = 0.5 * CABLE_RADIUS
 END_WEIGHT_INITIAL_OFFSET = 0.020
@@ -64,7 +68,7 @@ GRIPPER_PAD_CENTER_Y = GRIPPER_PAD_HALF_Y
 GRIPPER_PAD_CENTER_Z = 0.055
 
 PULLEY_RADIUS = 0.045
-PULLEY_WRAP_CLEARANCE = 1.1 * CABLE_RADIUS
+PULLEY_WRAP_CLEARANCE = 1.2 * CABLE_RADIUS
 PULLEY_WRAP_RADIUS = PULLEY_RADIUS + PULLEY_WRAP_CLEARANCE
 PULLEY_FIXED_Z = 1.10
 PULLEY_MOVING_Z = 0.72
@@ -1121,7 +1125,7 @@ class Example:
             child = int(self.joint_child[joint])
             parent_anchor = self._transform_point(body_q[parent], self.joint_X_p[joint, :3])
             child_anchor = self._transform_point(body_q[child], self.joint_X_c[joint, :3])
-            tensions.append(CABLE_STRETCH_STIFFNESS * float(np.linalg.norm(child_anchor - parent_anchor)))
+            tensions.append(float(np.linalg.norm(child_anchor - parent_anchor)))
         return float(np.median(tensions))
 
     def _end_box_center(self, body_q: np.ndarray) -> np.ndarray:
@@ -1265,9 +1269,9 @@ class Example:
             default="lagged",
             help="Proxy transfer mode.",
         )
-        parser.add_argument("--vbd-iterations", type=int, default=20, help="VBD iterations per coupled substep.")
-        parser.add_argument("--mujoco-iterations", type=int, default=20, help="MuJoCo solver iterations.")
-        parser.add_argument("--mujoco-ls-iterations", type=int, default=20, help="MuJoCo line-search iterations.")
+        parser.add_argument("--vbd-iterations", type=int, default=10, help="VBD iterations per coupled substep.")
+        parser.add_argument("--mujoco-iterations", type=int, default=100, help="MuJoCo solver iterations.")
+        parser.add_argument("--mujoco-ls-iterations", type=int, default=50, help="MuJoCo line-search iterations.")
         parser.add_argument(
             "--no-graph-capture",
             action="store_false",
