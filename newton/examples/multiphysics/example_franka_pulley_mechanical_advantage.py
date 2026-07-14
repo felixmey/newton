@@ -11,9 +11,8 @@
 # contact force between the MuJoCo gripper and the VBD mechanism without a
 # fixed robot-cable attachment.
 #
-# The cable is initialized as a straight rod and its body transforms are then
-# placed on an explicitly pre-wrapped route, following the initialization used
-# by cable_cross_slide_table. The final validation measures cable tension from
+# The cable is constructed in a straight structural rest pose, then its state
+# is initialized on an explicitly pre-wrapped route. Validation measures cable
 # the axial strain along a straight span clear of pulley contacts and checks the
 # expected force advantage.
 #
@@ -128,21 +127,6 @@ def set_gripper_target(joint_q: wp.array2d[float], finger_position: wp.array[flo
     """Set both Franka finger coordinates to the commanded half-width."""
     joint_q[0, index_0] = finger_position[0]
     joint_q[0, index_1] = finger_position[0]
-
-
-@wp.kernel
-def set_body_xforms(
-    body_indices: wp.array[wp.int32],
-    body_xforms: wp.array[wp.transform],
-    body_q0: wp.array[wp.transform],
-    body_q1: wp.array[wp.transform],
-):
-    """Place the straight-rest cable onto its pre-wrapped initial route."""
-    tid = wp.tid()
-    body = body_indices[tid]
-    xform = body_xforms[tid]
-    body_q0[body] = xform
-    body_q1[body] = xform
 
 
 def _capture_frame_graph(model: newton.Model, simulate: Callable[[], None], *, enabled: bool):
@@ -482,7 +466,23 @@ class Example:
         self.state_1 = self.model.state()
         newton.eval_fk(self.model, self.model.joint_q, self.model.joint_qd, self.state_0)
         newton.eval_fk(self.model, self.model.joint_q, self.model.joint_qd, self.state_1)
-        self._initialize_wrapped_cable()
+        initial_cable_xforms = wp.array(
+            self.initial_cable_xforms,
+            dtype=wp.transform,
+            device=self.device,
+        )
+        wp.copy(
+            self.state_0.body_q,
+            initial_cable_xforms,
+            dest_offset=self.cable_bodies[0],
+            count=len(self.cable_bodies),
+        )
+        wp.copy(
+            self.state_1.body_q,
+            initial_cable_xforms,
+            dest_offset=self.cable_bodies[0],
+            count=len(self.cable_bodies),
+        )
         initial_body_q = self.state_0.body_q.numpy()
         self.box_target_center = self._end_box_center(initial_body_q)
         self.gripper_pad_midpoint = self._gripper_pad_midpoint(initial_body_q)
@@ -713,7 +713,7 @@ class Example:
         straight_points, straight_quats = newton.utils.create_straight_cable_points_and_quaternions(
             start=cable_points[0],
             direction=wp.vec3(1.0, 0.0, 0.0),
-            length=cable_segment_count * self.cable_segment_length,
+            length=cable_segment_count * route_segment_length,
             num_segments=cable_segment_count,
         )
         cable_cfg = newton.ModelBuilder.ShapeConfig(
@@ -733,7 +733,7 @@ class Example:
             stretch_damping=CABLE_STRETCH_DAMPING,
             bend_stiffness=CABLE_BEND_STIFFNESS,
             bend_damping=CABLE_BEND_DAMPING,
-            wrap_in_articulation=False,
+            wrap_in_articulation=False,  # articulation is created manually later with anchor ball joint
             color=(0.82, 0.72, 0.46),
             label="block_and_tackle_cable",
         )
@@ -1006,21 +1006,6 @@ class Example:
             jacobian_mode=ik.IKJacobianType.ANALYTIC,
         )
         self.ik_iters = 24
-
-    def _initialize_wrapped_cable(self) -> None:
-        cable_body_indices = wp.array(self.cable_bodies, dtype=wp.int32, device=self.device)
-        cable_body_xforms = wp.array(self.initial_cable_xforms, dtype=wp.transform, device=self.device)
-        wp.launch(
-            set_body_xforms,
-            dim=cable_body_indices.shape[0],
-            inputs=[
-                cable_body_indices,
-                cable_body_xforms,
-                self.state_0.body_q,
-                self.state_1.body_q,
-            ],
-            device=self.device,
-        )
 
     def update_ik_target(self) -> None:
         t = min(self.sim_time, float(self.key_times[-1]) - 1.0e-6)
