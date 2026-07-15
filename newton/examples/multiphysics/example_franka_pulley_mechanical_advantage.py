@@ -52,15 +52,17 @@ CABLE_CONTACT_GAP = 0.5 * CABLE_RADIUS
 END_WEIGHT_INITIAL_OFFSET = 0.020
 END_BOX_HALF_X = 0.025
 END_BOX_HALF_Y = 0.025
-END_BOX_HALF_Z = 0.050
+END_BOX_HALF_Z = 0.030
 GRIPPER_FRICTION = 8.0
 GRIPPER_CONTACT_STIFFNESS = 2.0e4
 GRIPPER_CONTACT_DAMPING = 50.0
 GRIPPER_HEIGHT_CORRECTION_FILTER = 0.2
+GRIPPER_LATERAL_CORRECTION_MAX = 0.03
 GRIPPER_HEIGHT_CORRECTION_MAX = 0.06
+BOX_ROPE_LINE_TOLERANCE = 0.002
 
 PULLEY_RADIUS = 0.045
-PULLEY_WRAP_CLEARANCE = 1.2 * CABLE_RADIUS
+PULLEY_WRAP_CLEARANCE = 1.25 * CABLE_RADIUS
 PULLEY_WRAP_RADIUS = PULLEY_RADIUS + PULLEY_WRAP_CLEARANCE
 PULLEY_FIXED_Z = 1.10
 PULLEY_MOVING_Z = 0.72
@@ -453,6 +455,7 @@ class Example:
         self.pull_target_origin: np.ndarray | None = None
         self.latest_tension = 0.0
         self.latest_robot_downward_force = 0.0
+        self.gripper_lateral_correction = np.zeros(2, dtype=np.float64)
         self.gripper_height_correction = 0.0
         self.last_commanded_tcp_z = 0.0
 
@@ -485,7 +488,10 @@ class Example:
         )
         initial_body_q = self.state_0.body_q.numpy()
         self.box_target_center = self._end_box_center(initial_body_q)
+        if not np.allclose(self.box_target_center[:2], self.pull_line_xy, atol=1.0e-5):
+            raise ValueError("Graspable box is not initialized on the vertical free-rope line")
         self.gripper_pad_midpoint = self._gripper_pad_midpoint(initial_body_q)
+        self.gripper_tcp_position = self._gripper_tcp_position(initial_body_q)
         self.last_commanded_tcp_z = float(self.targets[0, 2])
         self.initial_load_z = float(initial_body_q[self.weight_body, 2])
         self.solver.sync_entry_states(self.state_0)
@@ -555,6 +561,7 @@ class Example:
         )
         pulley_block_half_y = 0.5 * pulley_pair_count * PULLEY_SHEAVE_SPACING
         pull_y = pulley_sheave_y[-1]
+        self.pull_line_xy = np.array([PULL_X, pull_y], dtype=np.float64)
 
         frame_color = (0.16, 0.22, 0.30)
         top_beam_center_z = PULLEY_FIXED_Z + 0.09
@@ -928,6 +935,23 @@ class Example:
         if len(self.mujoco_finger_bodies) != 2:
             raise ValueError("Could not map both Franka finger bodies into MuJoCo")
 
+        self.robot_proximal_gravity_compensation = 0.0
+        if self.coupling_solver == "admm":
+            global_finger_by_label = {self.model.body_label[body]: body for body in self.gripper_bodies}
+            local_mass = mujoco_view.body_mass.numpy()
+            global_mass = self.model.body_mass.numpy()
+            local_gravity = wp.empty(mujoco_view.body_count, dtype=wp.vec3, device=self.device)
+            self.mujoco_solver.coupling_eval_gravity_acceleration(local_gravity, None)
+            local_gravity = local_gravity.numpy()
+
+            for local_body in finger_local_bodies:
+                label = mujoco_view.body_label[local_body]
+                if label not in global_finger_by_label:
+                    raise ValueError(f"Could not map MuJoCo finger body {label!r} into the full model")
+                global_body = global_finger_by_label[label]
+                proximal_mass = max(0.0, float(local_mass[local_body] - global_mass[global_body]))
+                self.robot_proximal_gravity_compensation -= proximal_mass * float(local_gravity[local_body, 2])
+
     def _build_keyframes(self) -> None:
         start_position, start_rotation = self._initial_tcp_pose()
         approach_rotation = np.asarray(GRIPPER_APPROACH_ORIENTATION, dtype=np.float32)
@@ -1025,6 +1049,8 @@ class Example:
                 target_center = self.pull_target_origin
             else:
                 target_center = self.box_target_center
+            target_center = target_center.copy()
+            target_center[:2] = self.pull_line_xy
 
             center_offset = target_center - self.nominal_grasp_position
             current_position = current[:3] + center_offset
@@ -1035,15 +1061,23 @@ class Example:
             target[:3] = (1.0 - alpha) * previous_position + alpha * current_position
 
             if interval < self.pull_keyframe_index:
-                measured_offset = self.last_commanded_tcp_z - float(self.gripper_pad_midpoint[2])
+                measured_lateral_offset = self.gripper_tcp_position[:2] - self.gripper_pad_midpoint[:2]
+                self.gripper_lateral_correction = np.clip(
+                    (1.0 - GRIPPER_HEIGHT_CORRECTION_FILTER) * self.gripper_lateral_correction
+                    + GRIPPER_HEIGHT_CORRECTION_FILTER * measured_lateral_offset,
+                    -GRIPPER_LATERAL_CORRECTION_MAX,
+                    GRIPPER_LATERAL_CORRECTION_MAX,
+                )
+                measured_height_offset = self.last_commanded_tcp_z - float(self.gripper_pad_midpoint[2])
                 self.gripper_height_correction = float(
                     np.clip(
                         (1.0 - GRIPPER_HEIGHT_CORRECTION_FILTER) * self.gripper_height_correction
-                        + GRIPPER_HEIGHT_CORRECTION_FILTER * measured_offset,
+                        + GRIPPER_HEIGHT_CORRECTION_FILTER * measured_height_offset,
                         0.0,
                         GRIPPER_HEIGHT_CORRECTION_MAX,
                     )
                 )
+            target[:2] += self.gripper_lateral_correction
             target[2] += self.gripper_height_correction
 
         self.last_commanded_tcp_z = float(target[2])
@@ -1121,13 +1155,17 @@ class Example:
             axis=0,
         )
 
+    def _gripper_tcp_position(self, body_q: np.ndarray) -> np.ndarray:
+        return self._transform_point(body_q[self.hand_body], np.array([0.0, 0.0, 0.107], dtype=np.float64))
+
     def _measure_robot_downward_force(self) -> float:
         if self.mujoco_solver.use_mujoco_cpu:
             applied_wrenches = np.asarray(self.mujoco_solver.mj_data.xfrc_applied)
         else:
             applied_wrenches = self.mujoco_solver.mjw_data.xfrc_applied.numpy()[0]
         upward_reaction = float(np.sum(applied_wrenches[self.mujoco_finger_bodies, 2]))
-        return max(0.0, upward_reaction)
+        physical_reaction = upward_reaction - self.robot_proximal_gravity_compensation
+        return max(0.0, physical_reaction)
 
     def _record_diagnostics(self) -> None:
         body_q = self.state_0.body_q.numpy()
@@ -1136,10 +1174,11 @@ class Example:
         load_z = float(body_q[self.weight_body, 2])
         self.box_target_center = self._end_box_center(body_q)
         self.gripper_pad_midpoint = self._gripper_pad_midpoint(body_q)
+        self.gripper_tcp_position = self._gripper_tcp_position(body_q)
 
         force_ratio = (
             self.weight_mass * GRAVITY / self.latest_robot_downward_force
-            if self.latest_robot_downward_force > 1.0e-6
+            if self.latest_robot_downward_force > 1.0e-3
             else 0.0
         )
         # self.viewer.log_scalar("Cable tension [N]", self.latest_tension, smoothing=10)
@@ -1172,6 +1211,12 @@ class Example:
             raise ValueError("The Franka grasp never transmitted load into the VBD cable")
 
         body_q = self.state_0.body_q.numpy()
+        box_line_error = float(np.linalg.norm(self._end_box_center(body_q)[:2] - self.pull_line_xy))
+        if box_line_error > BOX_ROPE_LINE_TOLERANCE:
+            raise ValueError(
+                f"Graspable box is {box_line_error:.4f} m from the vertical free-rope line; "
+                f"expected at most {BOX_ROPE_LINE_TOLERANCE:.4f} m"
+            )
         final_load_z = float(body_q[self.weight_body, 2])
         load_lift = final_load_z - self.initial_load_z
         measured_tension = self.latest_tension
@@ -1212,7 +1257,7 @@ class Example:
             "--mechanical-advantage",
             type=int,
             default=DEFAULT_MECHANICAL_ADVANTAGE,
-            help="Even supporting-strand count (minimum 4).",
+            help="Even supporting-strand count (minimum 2).",
         )
         parser.add_argument(
             "--weight-mass",
