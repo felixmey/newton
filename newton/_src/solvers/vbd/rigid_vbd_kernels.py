@@ -2975,6 +2975,228 @@ def accumulate_body_particle_contacts_per_body(
 
 
 @wp.kernel
+def save_cable_chain_poses(
+    chain_bodies: wp.array[wp.int32],
+    body_q: wp.array[wp.transform],
+    q_before: wp.array[wp.transform],
+):
+    """Save compact cable-chain poses before a fine VBD sweep."""
+    node = wp.tid()
+    q_before[node] = body_q[chain_bodies[node]]
+
+
+@wp.func
+def _cable_pcr_external_joint_weight(joint_type: int, joint_dof_dim: wp.array2d[int], joint: int):
+    """Return the isotropic fraction of a joint's linear structural slot."""
+    if (
+        joint_type == JointType.CABLE
+        or joint_type == JointType.BALL
+        or joint_type == JointType.FIXED
+        or joint_type == JointType.REVOLUTE
+    ):
+        return 1.0
+    if joint_type == JointType.PRISMATIC:
+        return 2.0 / 3.0
+    if joint_type == JointType.D6:
+        return float(3 - joint_dof_dim[joint, 0]) / 3.0
+    return 0.0
+
+
+@wp.kernel
+def initialize_cable_chain_pcr(
+    dt: float,
+    chain_bodies: wp.array[wp.int32],
+    chain_index: wp.array[wp.int32],
+    chain_prev_joint: wp.array[wp.int32],
+    chain_next_joint: wp.array[wp.int32],
+    q_before: wp.array[wp.transform],
+    body_q: wp.array[wp.transform],
+    body_mass: wp.array[float],
+    body_inv_mass: wp.array[float],
+    body_contact_hessian: wp.array[wp.mat33],
+    adjacency: RigidForceElementAdjacencyInfo,
+    joint_type: wp.array[int],
+    joint_enabled: wp.array[bool],
+    joint_parent: wp.array[int],
+    joint_child: wp.array[int],
+    joint_X_p: wp.array[wp.transform],
+    joint_X_c: wp.array[wp.transform],
+    joint_dof_dim: wp.array2d[int],
+    joint_constraint_start: wp.array[wp.int32],
+    joint_penalty_k: wp.array[float],
+    joint_penalty_kd: wp.array[float],
+    lower: wp.array[float],
+    diagonal: wp.array[float],
+    upper: wp.array[float],
+    rhs: wp.array[wp.vec3],
+    chain_tension: wp.array[float],
+):
+    """Assemble a scalar cable-chain Newton approximation for PCR.
+
+    The diagonal contains translation inertia, cable stretch, rigid-contact
+    curvature, and structural joints attached to the world or a kinematic body.
+    The right-hand side reconstructs a residual from the preceding block-descent
+    update. Rotation and translation-rotation coupling remain with the fine VBD
+    smoother.
+    """
+    node = wp.tid()
+    body = chain_bodies[node]
+    next_joint = chain_next_joint[node]
+    if next_joint >= 0:
+        tension = 0.0
+        if joint_enabled[next_joint]:
+            start = joint_constraint_start[next_joint]
+            parent = joint_parent[next_joint]
+            child = joint_child[next_joint]
+            parent_pose = body_q[parent]
+            child_pose = body_q[child]
+            parent_anchor = wp.transform_get_translation(parent_pose * joint_X_p[next_joint])
+            child_anchor = wp.transform_get_translation(child_pose * joint_X_c[next_joint])
+            tangent = wp.transform_get_translation(child_pose) - wp.transform_get_translation(parent_pose)
+            tangent_length = wp.length(tangent)
+            if tangent_length > 1.0e-12:
+                axial_extension = wp.dot(child_anchor - parent_anchor, tangent / tangent_length)
+                tension = wp.max(0.0, joint_penalty_k[start] * axial_extension)
+        wp.atomic_min(chain_tension, chain_index[node], tension)
+
+    if body_inv_mass[body] <= 0.0:
+        lower[node] = 0.0
+        diagonal[node] = 1.0
+        upper[node] = 0.0
+        rhs[node] = wp.vec3(0.0)
+        return
+
+    inv_dt = 1.0 / dt
+    diag = body_mass[body] * inv_dt * inv_dt
+    diag += wp.max(0.0, wp.trace(body_contact_hessian[body]) / 3.0)
+
+    a = 0.0
+    c = 0.0
+    prev_joint = chain_prev_joint[node]
+    if prev_joint >= 0 and joint_enabled[prev_joint]:
+        start = joint_constraint_start[prev_joint]
+        stiffness = joint_penalty_k[start] + joint_penalty_kd[start] * inv_dt
+        a = -stiffness
+        diag += stiffness
+    if next_joint >= 0 and joint_enabled[next_joint]:
+        start = joint_constraint_start[next_joint]
+        stiffness = joint_penalty_k[start] + joint_penalty_kd[start] * inv_dt
+        c = -stiffness
+        diag += stiffness
+
+    # World and kinematic attachments provide boundary conditions for the
+    # global chain solve. Dynamic off-chain couplings stay in the fine smoother.
+    adjacent_joint_count = get_body_num_adjacent_joints(adjacency, body)
+    for adjacent_joint_counter in range(adjacent_joint_count):
+        joint = get_body_adjacent_joint_id(adjacency, body, adjacent_joint_counter)
+        if joint == prev_joint or joint == next_joint or not joint_enabled[joint]:
+            continue
+        parent = joint_parent[joint]
+        child = joint_child[joint]
+        other = parent if child == body else child
+        if other >= 0 and body_inv_mass[other] > 0.0:
+            continue
+        weight = _cable_pcr_external_joint_weight(joint_type[joint], joint_dof_dim, joint)
+        if weight > 0.0:
+            start = joint_constraint_start[joint]
+            diag += weight * (joint_penalty_k[start] + joint_penalty_kd[start] * inv_dt)
+
+    residual = wp.transform_get_translation(body_q[body]) - wp.transform_get_translation(q_before[node])
+    lower[node] = a
+    diagonal[node] = diag
+    upper[node] = c
+    rhs[node] = diag * residual
+
+
+@wp.kernel
+def solve_cable_chain_pcr_level(
+    stride: int,
+    chain_start: wp.array[wp.int32],
+    chain_end: wp.array[wp.int32],
+    lower_in: wp.array[float],
+    diagonal_in: wp.array[float],
+    upper_in: wp.array[float],
+    rhs_in: wp.array[wp.vec3],
+    lower_out: wp.array[float],
+    diagonal_out: wp.array[float],
+    upper_out: wp.array[float],
+    rhs_out: wp.array[wp.vec3],
+):
+    """Eliminate neighbors at one parallel cyclic-reduction level."""
+    node = wp.tid()
+    a = lower_in[node]
+    b = diagonal_in[node]
+    c = upper_in[node]
+    d = rhs_in[node]
+    a_new = 0.0
+    c_new = 0.0
+
+    left = node - stride
+    if left >= chain_start[node]:
+        b_left = diagonal_in[left]
+        if wp.abs(b_left) > 1.0e-20:
+            alpha = -a / b_left
+            b += alpha * upper_in[left]
+            d += alpha * rhs_in[left]
+            a_new = alpha * lower_in[left]
+
+    right = node + stride
+    if right < chain_end[node]:
+        b_right = diagonal_in[right]
+        if wp.abs(b_right) > 1.0e-20:
+            gamma = -c / b_right
+            b += gamma * lower_in[right]
+            d += gamma * rhs_in[right]
+            c_new = gamma * upper_in[right]
+
+    lower_out[node] = a_new
+    diagonal_out[node] = b
+    upper_out[node] = c_new
+    rhs_out[node] = d
+
+
+@wp.kernel
+def apply_cable_chain_pcr(
+    strength: float,
+    max_displacement: float,
+    chain_bodies: wp.array[wp.int32],
+    chain_index: wp.array[wp.int32],
+    chain_tension: wp.array[float],
+    chain_tension_threshold: wp.array[float],
+    q_before: wp.array[wp.transform],
+    body_inv_mass: wp.array[float],
+    diagonal: wp.array[float],
+    rhs: wp.array[wp.vec3],
+    body_q: wp.array[wp.transform],
+):
+    """Blend the fine VBD update with the globally solved chain update."""
+    node = wp.tid()
+    body = chain_bodies[node]
+    if body_inv_mass[body] <= 0.0 or diagonal[node] <= 1.0e-20:
+        return
+
+    pose = body_q[body]
+    residual = wp.transform_get_translation(pose) - wp.transform_get_translation(q_before[node])
+    global_update = rhs[node] / diagonal[node]
+    activation = 1.0
+    threshold = chain_tension_threshold[chain_index[node]]
+    if threshold > 0.0:
+        activation = wp.clamp(chain_tension[chain_index[node]] / threshold - 1.0, 0.0, 1.0)
+    if activation <= 0.0:
+        return
+
+    extra = strength * activation * (global_update - residual)
+    extra_length = wp.length(extra)
+    if extra_length > max_displacement and extra_length > 0.0:
+        extra *= max_displacement / extra_length
+
+    body_q[body] = wp.transform(
+        wp.transform_get_translation(pose) + extra,
+        wp.transform_get_rotation(pose),
+    )
+
+
+@wp.kernel
 def solve_rigid_body(
     dt: float,
     body_ids_in_color: wp.array[wp.int32],

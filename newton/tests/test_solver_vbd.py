@@ -32,6 +32,7 @@ from newton._src.solvers.vbd.rigid_vbd_kernels import (
     evaluate_rigid_contact_from_collision,
     init_body_body_contacts_avbd,
     snapshot_body_body_contact_history,
+    solve_cable_chain_pcr_level,
     update_duals_body_body_contacts,
     update_duals_joint,
 )
@@ -2087,6 +2088,71 @@ def _body_particle_contact_lists_skip_static_kinematic(test, device):
     test.assertEqual(int(overflow_max.numpy()[0]), 0)
 
 
+def _cable_chain_pcr_matches_dense_solve(test, device):
+    """Parallel cyclic reduction must solve packed tridiagonal chains independently."""
+    chain_lengths = (3, 4)
+    node_count = sum(chain_lengths)
+    diagonal_np = np.asarray([4.0, 5.0, 4.5, 6.0, 5.0, 5.5, 6.5], dtype=np.float32)
+    lower_np = np.zeros(node_count, dtype=np.float32)
+    upper_np = np.zeros(node_count, dtype=np.float32)
+    chain_start_np = np.empty(node_count, dtype=np.int32)
+    chain_end_np = np.empty(node_count, dtype=np.int32)
+    matrix = np.zeros((node_count, node_count), dtype=np.float32)
+
+    start = 0
+    for chain_length in chain_lengths:
+        end = start + chain_length
+        chain_start_np[start:end] = start
+        chain_end_np[start:end] = end
+        for node in range(start, end):
+            matrix[node, node] = diagonal_np[node]
+            if node > start:
+                lower_np[node] = -0.75
+                matrix[node, node - 1] = lower_np[node]
+            if node + 1 < end:
+                upper_np[node] = -0.75
+                matrix[node, node + 1] = upper_np[node]
+        start = end
+
+    rhs_np = np.arange(1, 3 * node_count + 1, dtype=np.float32).reshape(node_count, 3) / 10.0
+    expected = np.linalg.solve(matrix, rhs_np)
+
+    lower_in = wp.array(lower_np, dtype=float, device=device)
+    diagonal_in = wp.array(diagonal_np, dtype=float, device=device)
+    upper_in = wp.array(upper_np, dtype=float, device=device)
+    rhs_in = wp.array(rhs_np, dtype=wp.vec3, device=device)
+    lower_out = wp.empty_like(lower_in)
+    diagonal_out = wp.empty_like(diagonal_in)
+    upper_out = wp.empty_like(upper_in)
+    rhs_out = wp.empty_like(rhs_in)
+    chain_start = wp.array(chain_start_np, dtype=wp.int32, device=device)
+    chain_end = wp.array(chain_end_np, dtype=wp.int32, device=device)
+
+    for level in range(2):
+        wp.launch(
+            solve_cable_chain_pcr_level,
+            dim=node_count,
+            inputs=[
+                1 << level,
+                chain_start,
+                chain_end,
+                lower_in,
+                diagonal_in,
+                upper_in,
+                rhs_in,
+            ],
+            outputs=[lower_out, diagonal_out, upper_out, rhs_out],
+            device=device,
+        )
+        lower_in, lower_out = lower_out, lower_in
+        diagonal_in, diagonal_out = diagonal_out, diagonal_in
+        upper_in, upper_out = upper_out, upper_in
+        rhs_in, rhs_out = rhs_out, rhs_in
+
+    actual = rhs_in.numpy() / diagonal_in.numpy()[:, None]
+    np.testing.assert_allclose(actual, expected, rtol=2.0e-5, atol=2.0e-6)
+
+
 class TestSolverVBD(unittest.TestCase):
     pass
 
@@ -2101,6 +2167,12 @@ add_function_test(
     TestSolverVBD,
     "test_body_particle_contact_lists_skip_static_kinematic",
     _body_particle_contact_lists_skip_static_kinematic,
+    devices=devices,
+)
+add_function_test(
+    TestSolverVBD,
+    "test_cable_chain_pcr_matches_dense_solve",
+    _cable_chain_pcr_matches_dense_solve,
     devices=devices,
 )
 add_function_test(

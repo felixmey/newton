@@ -862,6 +862,11 @@ class Example:
                     rigid_body_contact_buffer_size=512,
                     rigid_contact_hard=False,
                     rigid_contact_history=False,
+                    rigid_cable_pcr_enabled=bool(args.vbd_cable_pcr),
+                    rigid_cable_pcr_strength=float(args.vbd_cable_pcr_strength),
+                    rigid_cable_pcr_interval=int(args.vbd_cable_pcr_interval),
+                    rigid_cable_pcr_max_displacement=float(args.vbd_cable_pcr_max_displacement),
+                    rigid_cable_pcr_min_tension_ratio=float(args.vbd_cable_pcr_min_tension_ratio),
                 ),
                 bodies=self.vbd_bodies,
                 joints=self.vbd_joints,
@@ -1243,6 +1248,35 @@ class Example:
             help="Proxy transfer mode.",
         )
         parser.add_argument("--vbd-iterations", type=int, default=10, help="VBD iterations per coupled substep.")
+        parser.add_argument(
+            "--vbd-cable-pcr",
+            action="store_true",
+            help="Enable the experimental GPU-parallel cable-chain PCR correction.",
+        )
+        parser.add_argument(
+            "--vbd-cable-pcr-strength",
+            type=float,
+            default=0.25,
+            help="Blend strength for the cable-chain PCR correction.",
+        )
+        parser.add_argument(
+            "--vbd-cable-pcr-interval",
+            type=int,
+            default=1,
+            help="VBD iteration interval between cable-chain PCR corrections.",
+        )
+        parser.add_argument(
+            "--vbd-cable-pcr-max-displacement",
+            type=float,
+            default=2.0e-3,
+            help="Maximum additional cable-body translation per PCR correction [m].",
+        )
+        parser.add_argument(
+            "--vbd-cable-pcr-min-tension-ratio",
+            type=float,
+            default=0.05,
+            help="Minimum cable-tension/chain-weight ratio where PCR activates; zero disables the tension gate.",
+        )
         parser.add_argument("--mujoco-iterations", type=int, default=100, help="MuJoCo solver iterations.")
         parser.add_argument("--mujoco-ls-iterations", type=int, default=50, help="MuJoCo line-search iterations.")
         parser.add_argument(

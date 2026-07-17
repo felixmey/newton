@@ -726,6 +726,55 @@ def _cable_loop_connectivity_impl(test: unittest.TestCase, device):
             )
 
 
+def _cable_pcr_open_chain_topology_and_stability_impl(test: unittest.TestCase, device):
+    """Cable PCR discovers open paths, skips loops, and preserves unloaded motion."""
+    model, baseline_state0, baseline_state1, control, rod_bodies = _build_cable_chain(device, num_links=8)
+    pcr_state0, pcr_state1 = model.state(), model.state()
+    default_solver = newton.solvers.SolverVBD(model, iterations=2)
+    test.assertEqual(default_solver.rigid_cable_pcr_chain_count, 0)
+    test.assertEqual(default_solver.rigid_cable_pcr_node_count, 0)
+
+    solver = newton.solvers.SolverVBD(model, iterations=2, rigid_cable_pcr_enabled=True)
+    test.assertEqual(solver.rigid_cable_pcr_chain_count, 1)
+    test.assertEqual(solver.rigid_cable_pcr_node_count, len(rod_bodies))
+    test.assertEqual(solver._rigid_cable_pcr_levels, 3)
+    packed_bodies = solver._rigid_cable_pcr_bodies.numpy()
+    np.testing.assert_array_equal(packed_bodies, np.asarray(rod_bodies, dtype=np.int32))
+
+    slack_state = model.state()
+    slack_q = slack_state.body_q.numpy()
+    slack_q[rod_bodies[-1], 0] -= 0.05
+    slack_state.body_q.assign(slack_q)
+    solver._rigid_cable_pcr_q_before.assign(slack_q[packed_bodies])
+    solver.body_hessian_ll.zero_()
+    solver._solve_rigid_cable_pcr(slack_state.body_q, dt=1.0 / 120.0)
+    np.testing.assert_allclose(solver._rigid_cable_pcr_chain_tension.numpy(), 0.0, rtol=0.0, atol=1.0e-6)
+    np.testing.assert_allclose(slack_state.body_q.numpy(), slack_q, rtol=0.0, atol=1.0e-7)
+
+    for _ in range(8):
+        default_solver.step(baseline_state0, baseline_state1, control, contacts=None, dt=1.0 / 120.0)
+        solver.step(pcr_state0, pcr_state1, control, contacts=None, dt=1.0 / 120.0)
+        baseline_state0, baseline_state1 = baseline_state1, baseline_state0
+        pcr_state0, pcr_state1 = pcr_state1, pcr_state0
+
+    baseline_q = baseline_state0.body_q.numpy()
+    baseline_qd = baseline_state0.body_qd.numpy()
+    pcr_q = pcr_state0.body_q.numpy()
+    pcr_qd = pcr_state0.body_qd.numpy()
+    test.assertTrue(np.isfinite(pcr_q).all())
+    test.assertTrue(np.isfinite(pcr_qd).all())
+    np.testing.assert_allclose(pcr_q, baseline_q, rtol=1.0e-6, atol=1.0e-6)
+    np.testing.assert_allclose(pcr_qd, baseline_qd, rtol=1.0e-6, atol=1.0e-6)
+    tension = solver._rigid_cable_pcr_chain_tension.numpy()
+    threshold = solver._rigid_cable_pcr_chain_tension_threshold.numpy()
+    test.assertTrue(np.all(tension <= threshold))
+
+    loop_model, _loop_state0, _loop_state1, _loop_control = _build_cable_loop(device, num_links=8)
+    loop_solver = newton.solvers.SolverVBD(loop_model, iterations=2, rigid_cable_pcr_enabled=True)
+    test.assertEqual(loop_solver.rigid_cable_pcr_chain_count, 0)
+    test.assertEqual(loop_solver.rigid_cable_pcr_node_count, 0)
+
+
 def _cable_bend_stiffness_impl(test: unittest.TestCase, device):
     """Cable VBD: bend stiffness sweep should have a noticeable effect on tip position."""
     # From soft to stiff. Build multiple cables in one model.
@@ -4291,6 +4340,12 @@ add_function_test(
     TestCable,
     "test_cable_loop_connectivity",
     _cable_loop_connectivity_impl,
+    devices=devices,
+)
+add_function_test(
+    TestCable,
+    "test_cable_pcr_open_chain_topology_and_stability",
+    _cable_pcr_open_chain_topology_and_stability_impl,
     devices=devices,
 )
 add_function_test(

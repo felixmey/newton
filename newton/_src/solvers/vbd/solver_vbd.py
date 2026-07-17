@@ -50,6 +50,7 @@ from .rigid_vbd_kernels import (
     _fill_adjacent_joints,
     accumulate_body_body_contacts_per_body,
     accumulate_body_particle_contacts_per_body,
+    apply_cable_chain_pcr,
     build_body_body_contact_lists,
     build_body_particle_contact_lists,
     check_contact_overflow,
@@ -59,7 +60,10 @@ from .rigid_vbd_kernels import (
     init_body_body_contact_materials,
     init_body_body_contacts_avbd,
     init_body_particle_contacts,
+    initialize_cable_chain_pcr,
+    save_cable_chain_poses,
     snapshot_body_body_contact_history,
+    solve_cable_chain_pcr_level,
     solve_rigid_body,
     step_body_body_contact_C0_lambda,
     step_joint_C0_lambda,
@@ -239,6 +243,12 @@ class SolverVBD(SolverBase, CouplingInterface):
         rigid_joint_angular_k_start: float = 1.0e1,  # Angular penalty seed (used when angular beta > 0)
         rigid_joint_linear_kd: float = 0.0,  # Absolute damping for non-cable linear joint constraints
         rigid_joint_angular_kd: float = 0.0,  # Absolute damping for non-cable angular joint constraints
+        # Rigid body - cable-chain global correction
+        rigid_cable_pcr_enabled: bool = False,
+        rigid_cable_pcr_strength: float = 0.25,
+        rigid_cable_pcr_interval: int = 1,
+        rigid_cable_pcr_max_displacement: float = 2.0e-3,
+        rigid_cable_pcr_min_tension_ratio: float = 0.05,
     ):
         """
         Args:
@@ -346,6 +356,17 @@ class SolverVBD(SolverBase, CouplingInterface):
                 Negative values are clamped to 0.
             rigid_joint_angular_kd: Damping coefficient for non-cable angular joint constraints [N·m·s/rad].
                 Negative values are clamped to 0.
+            rigid_cable_pcr_enabled: Whether to apply a GPU-parallel cyclic-reduction correction to open chains of
+                CABLE joints. The correction accelerates translation propagation after fine VBD sweeps. Closed loops
+                and branched cable graphs remain on the standard VBD path.
+            rigid_cable_pcr_strength: Blend factor between the fine VBD translation update and the globally solved
+                cable-chain update. Larger values propagate forces faster but can reduce robustness.
+            rigid_cable_pcr_interval: Apply the cable-chain correction every this many VBD iterations. The final
+                iteration is always corrected when the feature is enabled.
+            rigid_cable_pcr_max_displacement: Maximum additional translation applied by one cable-chain correction [m].
+            rigid_cable_pcr_min_tension_ratio: Minimum tensile force transmitted through every cable joint, as a
+                multiple of the chain's own weight, at which PCR activation begins. It reaches full strength at twice
+                this ratio. Set to ``0`` to disable tension-based activation.
 
         Note:
             - The `integrate_with_external_rigid_solver` argument enables one-way coupling between rigid body and soft body
@@ -420,6 +441,11 @@ class SolverVBD(SolverBase, CouplingInterface):
             rigid_joint_angular_k_start,
             rigid_joint_linear_kd,
             rigid_joint_angular_kd,
+            rigid_cable_pcr_enabled,
+            rigid_cable_pcr_strength,
+            rigid_cable_pcr_interval,
+            rigid_cable_pcr_max_displacement,
+            rigid_cable_pcr_min_tension_ratio,
         )
 
         # Controls whether the next step() refreshes contact state derived from
@@ -545,6 +571,11 @@ class SolverVBD(SolverBase, CouplingInterface):
         rigid_joint_angular_k_start: float,
         rigid_joint_linear_kd: float,
         rigid_joint_angular_kd: float,
+        rigid_cable_pcr_enabled: bool,
+        rigid_cable_pcr_strength: float,
+        rigid_cable_pcr_interval: int,
+        rigid_cable_pcr_max_displacement: float,
+        rigid_cable_pcr_min_tension_ratio: float,
     ) -> None:
         """Initialize rigid body-specific AVBD data structures and settings.
 
@@ -586,6 +617,22 @@ class SolverVBD(SolverBase, CouplingInterface):
             raise ValueError(f"rigid_joint_linear_ke must be >= 0, got {rigid_joint_linear_ke}")
         if rigid_joint_angular_ke < 0:
             raise ValueError(f"rigid_joint_angular_ke must be >= 0, got {rigid_joint_angular_ke}")
+        if not (0.0 < rigid_cable_pcr_strength <= 1.0):
+            raise ValueError(f"rigid_cable_pcr_strength must be in (0, 1], got {rigid_cable_pcr_strength}")
+        if rigid_cable_pcr_interval < 1:
+            raise ValueError(f"rigid_cable_pcr_interval must be >= 1, got {rigid_cable_pcr_interval}")
+        if rigid_cable_pcr_max_displacement <= 0.0:
+            raise ValueError(f"rigid_cable_pcr_max_displacement must be > 0, got {rigid_cable_pcr_max_displacement}")
+        if rigid_cable_pcr_min_tension_ratio < 0.0:
+            raise ValueError(f"rigid_cable_pcr_min_tension_ratio must be >= 0, got {rigid_cable_pcr_min_tension_ratio}")
+        self.rigid_cable_pcr_enabled = rigid_cable_pcr_enabled
+        self.rigid_cable_pcr_strength = rigid_cable_pcr_strength
+        self.rigid_cable_pcr_interval = rigid_cable_pcr_interval
+        self.rigid_cable_pcr_max_displacement = rigid_cable_pcr_max_displacement
+        self.rigid_cable_pcr_min_tension_ratio = rigid_cable_pcr_min_tension_ratio
+        self.rigid_cable_pcr_chain_count = 0
+        self.rigid_cable_pcr_node_count = 0
+        self._rigid_cable_pcr_levels = 0
         self.rigid_avbd_gamma = rigid_avbd_gamma
         self.rigid_contact_k_start_value = -1.0 if rigid_avbd_linear_beta == 0.0 else float(rigid_contact_k_start)
         self.rigid_joint_linear_k_start = rigid_joint_linear_k_start if rigid_avbd_linear_beta > 0.0 else None
@@ -732,6 +779,8 @@ class SolverVBD(SolverBase, CouplingInterface):
         # Kinematic body support: create effective inv_mass / inv_inertia arrays
         # with kinematic bodies zeroed out.
         self._init_kinematic_state()
+        if self.rigid_cable_pcr_enabled and not self.integrate_with_external_rigid_solver and model.body_count > 0:
+            self._init_rigid_cable_pcr()
 
         # Pre-allocate body-body contact buffers when the contact capacity is
         # already known; otherwise lazy allocation handles the first step.
@@ -1077,6 +1126,123 @@ class SolverVBD(SolverBase, CouplingInterface):
         cpu = arr.to("cpu")
         result = cpu.numpy() if hasattr(cpu, "numpy") else np.asarray(cpu)
         return result if dtype is None else result.astype(dtype, copy=False)
+
+    def _init_rigid_cable_pcr(self) -> None:
+        """Discover open cable chains and allocate compact PCR buffers."""
+        joint_type = self._to_numpy(self.model.joint_type, dtype=int)
+        joint_parent = self._to_numpy(self.model.joint_parent, dtype=int)
+        joint_child = self._to_numpy(self.model.joint_child, dtype=int)
+        body_mass = self._to_numpy(self.model.body_mass, dtype=float)
+        gravity = self._to_numpy(self.model.gravity, dtype=float).reshape(-1, 3)[0]
+        gravity_magnitude = float(np.linalg.norm(gravity))
+
+        graph: dict[int, list[tuple[int, int]]] = {}
+        for joint in range(self.model.joint_count):
+            if joint_type[joint] != JointType.CABLE:
+                continue
+            parent = int(joint_parent[joint])
+            child = int(joint_child[joint])
+            if parent < 0 or child < 0 or parent == child:
+                continue
+            graph.setdefault(parent, []).append((child, joint))
+            graph.setdefault(child, []).append((parent, joint))
+
+        packed_bodies: list[int] = []
+        packed_prev_joint: list[int] = []
+        packed_next_joint: list[int] = []
+        packed_chain_index: list[int] = []
+        packed_start: list[int] = []
+        packed_end: list[int] = []
+        chain_lengths: list[int] = []
+        chain_tension_thresholds: list[float] = []
+        visited: set[int] = set()
+
+        for seed in sorted(graph):
+            if seed in visited:
+                continue
+            stack = [seed]
+            component_nodes: set[int] = set()
+            component_joints: set[int] = set()
+            while stack:
+                body = stack.pop()
+                if body in component_nodes:
+                    continue
+                component_nodes.add(body)
+                for neighbor, joint in graph[body]:
+                    component_joints.add(joint)
+                    if neighbor not in component_nodes:
+                        stack.append(neighbor)
+            visited.update(component_nodes)
+
+            # PCR handles tridiagonal open paths. Cycles and branches retain the
+            # standard fine VBD solve until a cyclic/block extension is available.
+            endpoints = sorted(body for body in component_nodes if len(graph[body]) == 1)
+            if (
+                len(component_nodes) < 2
+                or len(component_joints) != len(component_nodes) - 1
+                or len(endpoints) != 2
+                or any(len(graph[body]) > 2 for body in component_nodes)
+            ):
+                continue
+
+            path_bodies: list[int] = []
+            path_joints: list[int] = []
+            previous = -1
+            current = endpoints[0]
+            while True:
+                path_bodies.append(current)
+                candidates = [(neighbor, joint) for neighbor, joint in graph[current] if neighbor != previous]
+                if not candidates:
+                    break
+                if len(candidates) != 1:
+                    path_bodies = []
+                    break
+                neighbor, joint = candidates[0]
+                path_joints.append(joint)
+                previous, current = current, neighbor
+
+            if len(path_bodies) != len(component_nodes) or len(path_joints) + 1 != len(path_bodies):
+                continue
+
+            start = len(packed_bodies)
+            end = start + len(path_bodies)
+            packed_bodies.extend(path_bodies)
+            packed_prev_joint.extend([-1, *path_joints])
+            packed_next_joint.extend([*path_joints, -1])
+            packed_chain_index.extend([len(chain_lengths)] * len(path_bodies))
+            packed_start.extend([start] * len(path_bodies))
+            packed_end.extend([end] * len(path_bodies))
+            chain_lengths.append(len(path_bodies))
+            chain_mass = float(np.sum(body_mass[path_bodies]))
+            tension_reference = max(chain_mass * gravity_magnitude, 1.0e-6)
+            chain_tension_thresholds.append(self.rigid_cable_pcr_min_tension_ratio * tension_reference)
+
+        if not packed_bodies:
+            return
+
+        node_count = len(packed_bodies)
+        self.rigid_cable_pcr_chain_count = len(chain_lengths)
+        self.rigid_cable_pcr_node_count = node_count
+        self._rigid_cable_pcr_levels = (max(chain_lengths) - 1).bit_length()
+        self._rigid_cable_pcr_bodies = wp.array(packed_bodies, dtype=wp.int32, device=self.device)
+        self._rigid_cable_pcr_prev_joint = wp.array(packed_prev_joint, dtype=wp.int32, device=self.device)
+        self._rigid_cable_pcr_next_joint = wp.array(packed_next_joint, dtype=wp.int32, device=self.device)
+        self._rigid_cable_pcr_chain_index = wp.array(packed_chain_index, dtype=wp.int32, device=self.device)
+        self._rigid_cable_pcr_start = wp.array(packed_start, dtype=wp.int32, device=self.device)
+        self._rigid_cable_pcr_end = wp.array(packed_end, dtype=wp.int32, device=self.device)
+        self._rigid_cable_pcr_chain_tension = wp.empty(len(chain_lengths), dtype=float, device=self.device)
+        self._rigid_cable_pcr_chain_tension_threshold = wp.array(
+            chain_tension_thresholds, dtype=float, device=self.device
+        )
+        self._rigid_cable_pcr_q_before = wp.empty(node_count, dtype=wp.transform, device=self.device)
+        self._rigid_cable_pcr_lower_0 = wp.empty(node_count, dtype=float, device=self.device)
+        self._rigid_cable_pcr_diagonal_0 = wp.empty(node_count, dtype=float, device=self.device)
+        self._rigid_cable_pcr_upper_0 = wp.empty(node_count, dtype=float, device=self.device)
+        self._rigid_cable_pcr_rhs_0 = wp.empty(node_count, dtype=wp.vec3, device=self.device)
+        self._rigid_cable_pcr_lower_1 = wp.empty(node_count, dtype=float, device=self.device)
+        self._rigid_cable_pcr_diagonal_1 = wp.empty(node_count, dtype=float, device=self.device)
+        self._rigid_cable_pcr_upper_1 = wp.empty(node_count, dtype=float, device=self.device)
+        self._rigid_cable_pcr_rhs_1 = wp.empty(node_count, dtype=wp.vec3, device=self.device)
 
     def _init_joint_constraint_layout(self) -> None:
         """Initialize VBD-owned joint constraint indexing.
@@ -1636,7 +1802,7 @@ class SolverVBD(SolverBase, CouplingInterface):
         self._initialize_particles(state_in, state_out, dt)
 
         for iter_num in range(self.iterations):
-            self._solve_rigid_body_iteration(state_in, state_out, control, contacts, dt)
+            self._solve_rigid_body_iteration(state_in, state_out, control, contacts, dt, iter_num)
             self._solve_particle_iteration(state_in, state_out, contacts, dt, iter_num)
 
         # Snapshot solved rigid contact state for next-frame warm-start.
@@ -2365,8 +2531,102 @@ class SolverVBD(SolverBase, CouplingInterface):
 
         wp.copy(state_out.particle_q, state_in.particle_q)
 
+    def _solve_rigid_cable_pcr(self, body_q: wp.array[wp.transform], dt: float) -> None:
+        """Apply the compact global translation correction to discovered cable chains."""
+        node_count = self.rigid_cable_pcr_node_count
+        self._rigid_cable_pcr_chain_tension.fill_(1.0e30)
+        wp.launch(
+            kernel=initialize_cable_chain_pcr,
+            dim=node_count,
+            inputs=[
+                dt,
+                self._rigid_cable_pcr_bodies,
+                self._rigid_cable_pcr_chain_index,
+                self._rigid_cable_pcr_prev_joint,
+                self._rigid_cable_pcr_next_joint,
+                self._rigid_cable_pcr_q_before,
+                body_q,
+                self.model.body_mass,
+                self.body_inv_mass_effective,
+                self.body_hessian_ll,
+                self.rigid_adjacency,
+                self.model.joint_type,
+                self.model.joint_enabled,
+                self.model.joint_parent,
+                self.model.joint_child,
+                self.model.joint_X_p,
+                self.model.joint_X_c,
+                self.model.joint_dof_dim,
+                self.joint_constraint_start,
+                self.joint_penalty_k,
+                self.joint_penalty_kd,
+            ],
+            outputs=[
+                self._rigid_cable_pcr_lower_0,
+                self._rigid_cable_pcr_diagonal_0,
+                self._rigid_cable_pcr_upper_0,
+                self._rigid_cable_pcr_rhs_0,
+                self._rigid_cable_pcr_chain_tension,
+            ],
+            device=self.device,
+        )
+
+        lower_in = self._rigid_cable_pcr_lower_0
+        diagonal_in = self._rigid_cable_pcr_diagonal_0
+        upper_in = self._rigid_cable_pcr_upper_0
+        rhs_in = self._rigid_cable_pcr_rhs_0
+        lower_out = self._rigid_cable_pcr_lower_1
+        diagonal_out = self._rigid_cable_pcr_diagonal_1
+        upper_out = self._rigid_cable_pcr_upper_1
+        rhs_out = self._rigid_cable_pcr_rhs_1
+        for level in range(self._rigid_cable_pcr_levels):
+            wp.launch(
+                kernel=solve_cable_chain_pcr_level,
+                dim=node_count,
+                inputs=[
+                    1 << level,
+                    self._rigid_cable_pcr_start,
+                    self._rigid_cable_pcr_end,
+                    lower_in,
+                    diagonal_in,
+                    upper_in,
+                    rhs_in,
+                ],
+                outputs=[lower_out, diagonal_out, upper_out, rhs_out],
+                device=self.device,
+            )
+            lower_in, lower_out = lower_out, lower_in
+            diagonal_in, diagonal_out = diagonal_out, diagonal_in
+            upper_in, upper_out = upper_out, upper_in
+            rhs_in, rhs_out = rhs_out, rhs_in
+
+        wp.launch(
+            kernel=apply_cable_chain_pcr,
+            dim=node_count,
+            inputs=[
+                self.rigid_cable_pcr_strength,
+                self.rigid_cable_pcr_max_displacement,
+                self._rigid_cable_pcr_bodies,
+                self._rigid_cable_pcr_chain_index,
+                self._rigid_cable_pcr_chain_tension,
+                self._rigid_cable_pcr_chain_tension_threshold,
+                self._rigid_cable_pcr_q_before,
+                self.body_inv_mass_effective,
+                diagonal_in,
+                rhs_in,
+            ],
+            outputs=[body_q],
+            device=self.device,
+        )
+
     def _solve_rigid_body_iteration(
-        self, state_in: State, state_out: State, control: Control, contacts: Contacts | None, dt: float
+        self,
+        state_in: State,
+        state_out: State,
+        control: Control,
+        contacts: Contacts | None,
+        dt: float,
+        iter_num: int,
     ):
         """Solve one AVBD iteration for rigid bodies (per-iteration phase).
 
@@ -2405,6 +2665,18 @@ class SolverVBD(SolverBase, CouplingInterface):
                     device=self.device,
                 )
             return
+
+        apply_cable_pcr = self.rigid_cable_pcr_node_count > 0 and (
+            (iter_num + 1) % self.rigid_cable_pcr_interval == 0 or iter_num + 1 == self.iterations
+        )
+        if apply_cable_pcr:
+            wp.launch(
+                kernel=save_cable_chain_poses,
+                dim=self.rigid_cable_pcr_node_count,
+                inputs=[self._rigid_cable_pcr_bodies, state_in.body_q],
+                outputs=[self._rigid_cable_pcr_q_before],
+                device=self.device,
+            )
 
         # Zero out forces and hessians
         self.body_torques.zero_()
@@ -2562,6 +2834,9 @@ class SolverVBD(SolverBase, CouplingInterface):
                 dim=color_group.size,
                 device=self.device,
             )
+
+        if apply_cable_pcr:
+            self._solve_rigid_cable_pcr(state_in.body_q, dt)
 
         if contacts is not None:
             contact_launch_dim = contacts.rigid_contact_max
