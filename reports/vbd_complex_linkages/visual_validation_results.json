@@ -1,0 +1,124 @@
+{
+  "cable_convergence": [
+    {
+      "best_local_residual_at_budget_m": 0.010649001496425305,
+      "iterations": 1,
+      "mode": "local",
+      "p50_step_us": 30.199997127056122,
+      "residual_m": 0.010649001496425305,
+      "residual_reduction_at_budget": 1.0
+    },
+    {
+      "best_local_residual_at_budget_m": 0.010649001496425305,
+      "iterations": 1,
+      "mode": "block_sparse_joints",
+      "p50_step_us": 41.2999652326107,
+      "residual_m": 0.00021458616199014345,
+      "residual_reduction_at_budget": 49.62576056938119
+    },
+    {
+      "best_local_residual_at_budget_m": 0.002137297918168933,
+      "iterations": 2,
+      "mode": "local",
+      "p50_step_us": 55.75490649789572,
+      "residual_m": 0.002137297918168933,
+      "residual_reduction_at_budget": 1.0
+    },
+    {
+      "best_local_residual_at_budget_m": 0.002137297918168933,
+      "iterations": 2,
+      "mode": "block_sparse_joints",
+      "p50_step_us": 76.92491635680199,
+      "residual_m": 0.00012146287872222673,
+      "residual_reduction_at_budget": 17.596305477467862
+    },
+    {
+      "best_local_residual_at_budget_m": 0.0021090773183286855,
+      "iterations": 4,
+      "mode": "local",
+      "p50_step_us": 106.3300296664238,
+      "residual_m": 0.0021090773183286855,
+      "residual_reduction_at_budget": 1.0
+    },
+    {
+      "best_local_residual_at_budget_m": 0.0021090773183286855,
+      "iterations": 4,
+      "mode": "block_sparse_joints",
+      "p50_step_us": 151.25004574656487,
+      "residual_m": 3.811027647703109e-06,
+      "residual_reduction_at_budget": 553.4143315910652
+    },
+    {
+      "best_local_residual_at_budget_m": 0.0005181802679211445,
+      "iterations": 8,
+      "mode": "local",
+      "p50_step_us": 208.2899445667863,
+      "residual_m": 0.0005181802679211445,
+      "residual_reduction_at_budget": 1.0
+    },
+    {
+      "best_local_residual_at_budget_m": 0.0005181802679211445,
+      "iterations": 8,
+      "mode": "block_sparse_joints",
+      "p50_step_us": 299.16991479694843,
+      "residual_m": 1.118999165893441e-06,
+      "residual_reduction_at_budget": 463.074757975726
+    },
+    {
+      "best_local_residual_at_budget_m": 0.0002702390737301479,
+      "iterations": 16,
+      "mode": "local",
+      "p50_step_us": 414.05996307730675,
+      "residual_m": 0.0002702390737301479,
+      "residual_reduction_at_budget": 1.0
+    },
+    {
+      "best_local_residual_at_budget_m": 0.0002702390737301479,
+      "iterations": 16,
+      "mode": "block_sparse_joints",
+      "p50_step_us": 594.8098842054605,
+      "residual_m": 1.517217664313244e-07,
+      "residual_reduction_at_budget": 1781.149007729681
+    }
+  ],
+  "visuals": [
+    {
+      "local": {
+        "finite": true,
+        "iterations": 8,
+        "max_residual_um": 12.639094891236363,
+        "mode": "local",
+        "rms_residual_um": 1.1338838431198024
+      },
+      "poster": "videos/four-bar_local_vs_sparse.jpg",
+      "scenario": "four-bar",
+      "sparse": {
+        "finite": true,
+        "iterations": 8,
+        "max_residual_um": 0.6749414305630838,
+        "mode": "block_sparse_joints",
+        "rms_residual_um": 0.26525660391955197
+      },
+      "video": "videos/four-bar_local_vs_sparse.mp4"
+    },
+    {
+      "local": {
+        "finite": true,
+        "iterations": 4,
+        "max_residual_um": 1572.5724716444618,
+        "mode": "local",
+        "rms_residual_um": 845.8794300534776
+      },
+      "poster": "videos/cable_local_vs_sparse.jpg",
+      "scenario": "cable",
+      "sparse": {
+        "finite": true,
+        "iterations": 4,
+        "max_residual_um": 59.71027769627594,
+        "mode": "block_sparse_joints",
+        "rms_residual_um": 31.960195362647692
+      },
+      "video": "videos/cable_local_vs_sparse.mp4"
+    }
+  ]
+}
