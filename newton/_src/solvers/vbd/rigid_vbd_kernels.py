@@ -2985,6 +2985,36 @@ def save_cable_chain_poses(
     q_before[node] = body_q[chain_bodies[node]]
 
 
+@wp.kernel
+def accumulate_cable_chain_weight(
+    chain_bodies: wp.array[wp.int32],
+    chain_index: wp.array[wp.int32],
+    body_mass: wp.array[float],
+    body_inv_mass: wp.array[float],
+    body_world: wp.array[wp.int32],
+    gravity: wp.array[wp.vec3],
+    chain_weight: wp.array[float],
+):
+    """Accumulate current dynamic-body weight for each cable chain."""
+    node = wp.tid()
+    body = chain_bodies[node]
+    if body_inv_mass[body] <= 0.0:
+        return
+    world = wp.max(body_world[body], 0)
+    wp.atomic_add(chain_weight, chain_index[node], body_mass[body] * wp.length(gravity[world]))
+
+
+@wp.kernel
+def finalize_cable_chain_tension_threshold(
+    min_tension_ratio: float,
+    chain_weight: wp.array[float],
+    chain_tension_threshold: wp.array[float],
+):
+    """Convert cable-chain weight to a minimum activation tension."""
+    chain = wp.tid()
+    chain_tension_threshold[chain] = min_tension_ratio * wp.max(chain_weight[chain], 1.0e-6)
+
+
 @wp.func
 def _cable_pcr_external_joint_weight(joint_type: int, joint_dof_dim: wp.array2d[int], joint: int):
     """Return the isotropic fraction of a joint's linear structural slot."""

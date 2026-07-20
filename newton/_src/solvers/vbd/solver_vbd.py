@@ -50,12 +50,14 @@ from .rigid_vbd_kernels import (
     _fill_adjacent_joints,
     accumulate_body_body_contacts_per_body,
     accumulate_body_particle_contacts_per_body,
+    accumulate_cable_chain_weight,
     apply_cable_chain_pcr,
     build_body_body_contact_lists,
     build_body_particle_contact_lists,
     check_contact_overflow,
     compute_cable_dahl_parameters,
     compute_rigid_contact_forces,
+    finalize_cable_chain_tension_threshold,
     forward_step_rigid_bodies,
     init_body_body_contact_materials,
     init_body_body_contacts_avbd,
@@ -361,8 +363,9 @@ class SolverVBD(SolverBase, CouplingInterface):
                 and branched cable graphs remain on the standard VBD path.
             rigid_cable_pcr_strength: Blend factor between the fine VBD translation update and the globally solved
                 cable-chain update. Larger values propagate forces faster but can reduce robustness.
-            rigid_cable_pcr_interval: Apply the cable-chain correction every this many VBD iterations. The final
-                iteration is always corrected when the feature is enabled.
+            rigid_cable_pcr_interval: Apply the cable-chain correction every this many VBD iterations. The penultimate
+                iteration is always corrected when the feature is enabled and at least two VBD iterations are
+                configured, leaving the final iteration to smooth coupled joints and contacts.
             rigid_cable_pcr_max_displacement: Maximum additional translation applied by one cable-chain correction [m].
             rigid_cable_pcr_min_tension_ratio: Minimum tensile force transmitted through every cable joint, as a
                 multiple of the chain's own weight, at which PCR activation begins. It reaches full strength at twice
@@ -812,6 +815,10 @@ class SolverVBD(SolverBase, CouplingInterface):
     def notify_model_changed(self, flags: ModelFlags | int) -> None:
         if flags & (ModelFlags.BODY_PROPERTIES | ModelFlags.BODY_INERTIAL_PROPERTIES):
             self._refresh_kinematic_state()
+        if self.rigid_cable_pcr_node_count > 0 and flags & (
+            ModelFlags.BODY_PROPERTIES | ModelFlags.BODY_INERTIAL_PROPERTIES | ModelFlags.MODEL_PROPERTIES
+        ):
+            self._refresh_rigid_cable_pcr_tension_thresholds()
 
     @override
     def coupling_supports_inertial_property_refresh(self) -> bool:
@@ -1132,9 +1139,6 @@ class SolverVBD(SolverBase, CouplingInterface):
         joint_type = self._to_numpy(self.model.joint_type, dtype=int)
         joint_parent = self._to_numpy(self.model.joint_parent, dtype=int)
         joint_child = self._to_numpy(self.model.joint_child, dtype=int)
-        body_mass = self._to_numpy(self.model.body_mass, dtype=float)
-        gravity = self._to_numpy(self.model.gravity, dtype=float).reshape(-1, 3)[0]
-        gravity_magnitude = float(np.linalg.norm(gravity))
 
         graph: dict[int, list[tuple[int, int]]] = {}
         for joint in range(self.model.joint_count):
@@ -1154,7 +1158,6 @@ class SolverVBD(SolverBase, CouplingInterface):
         packed_start: list[int] = []
         packed_end: list[int] = []
         chain_lengths: list[int] = []
-        chain_tension_thresholds: list[float] = []
         visited: set[int] = set()
 
         for seed in sorted(graph):
@@ -1213,9 +1216,6 @@ class SolverVBD(SolverBase, CouplingInterface):
             packed_start.extend([start] * len(path_bodies))
             packed_end.extend([end] * len(path_bodies))
             chain_lengths.append(len(path_bodies))
-            chain_mass = float(np.sum(body_mass[path_bodies]))
-            tension_reference = max(chain_mass * gravity_magnitude, 1.0e-6)
-            chain_tension_thresholds.append(self.rigid_cable_pcr_min_tension_ratio * tension_reference)
 
         if not packed_bodies:
             return
@@ -1231,9 +1231,8 @@ class SolverVBD(SolverBase, CouplingInterface):
         self._rigid_cable_pcr_start = wp.array(packed_start, dtype=wp.int32, device=self.device)
         self._rigid_cable_pcr_end = wp.array(packed_end, dtype=wp.int32, device=self.device)
         self._rigid_cable_pcr_chain_tension = wp.empty(len(chain_lengths), dtype=float, device=self.device)
-        self._rigid_cable_pcr_chain_tension_threshold = wp.array(
-            chain_tension_thresholds, dtype=float, device=self.device
-        )
+        self._rigid_cable_pcr_chain_weight = wp.empty(len(chain_lengths), dtype=float, device=self.device)
+        self._rigid_cable_pcr_chain_tension_threshold = wp.empty(len(chain_lengths), dtype=float, device=self.device)
         self._rigid_cable_pcr_q_before = wp.empty(node_count, dtype=wp.transform, device=self.device)
         self._rigid_cable_pcr_lower_0 = wp.empty(node_count, dtype=float, device=self.device)
         self._rigid_cable_pcr_diagonal_0 = wp.empty(node_count, dtype=float, device=self.device)
@@ -1243,6 +1242,35 @@ class SolverVBD(SolverBase, CouplingInterface):
         self._rigid_cable_pcr_diagonal_1 = wp.empty(node_count, dtype=float, device=self.device)
         self._rigid_cable_pcr_upper_1 = wp.empty(node_count, dtype=float, device=self.device)
         self._rigid_cable_pcr_rhs_1 = wp.empty(node_count, dtype=wp.vec3, device=self.device)
+        self._refresh_rigid_cable_pcr_tension_thresholds()
+
+    def _refresh_rigid_cable_pcr_tension_thresholds(self) -> None:
+        """Refresh per-chain activation thresholds from current dynamic weight."""
+        if self.rigid_cable_pcr_chain_count == 0:
+            return
+
+        self._rigid_cable_pcr_chain_weight.zero_()
+        wp.launch(
+            kernel=accumulate_cable_chain_weight,
+            dim=self.rigid_cable_pcr_node_count,
+            inputs=[
+                self._rigid_cable_pcr_bodies,
+                self._rigid_cable_pcr_chain_index,
+                self.model.body_mass,
+                self.body_inv_mass_effective,
+                self.model.body_world,
+                self.model.gravity,
+            ],
+            outputs=[self._rigid_cable_pcr_chain_weight],
+            device=self.device,
+        )
+        wp.launch(
+            kernel=finalize_cable_chain_tension_threshold,
+            dim=self.rigid_cable_pcr_chain_count,
+            inputs=[self.rigid_cable_pcr_min_tension_ratio, self._rigid_cable_pcr_chain_weight],
+            outputs=[self._rigid_cable_pcr_chain_tension_threshold],
+            device=self.device,
+        )
 
     def _init_joint_constraint_layout(self) -> None:
         """Initialize VBD-owned joint constraint indexing.
@@ -2666,8 +2694,11 @@ class SolverVBD(SolverBase, CouplingInterface):
                 )
             return
 
-        apply_cable_pcr = self.rigid_cable_pcr_node_count > 0 and (
-            (iter_num + 1) % self.rigid_cable_pcr_interval == 0 or iter_num + 1 == self.iterations
+        has_followup_smoothing = iter_num + 1 < self.iterations
+        apply_cable_pcr = (
+            self.rigid_cable_pcr_node_count > 0
+            and has_followup_smoothing
+            and ((iter_num + 1) % self.rigid_cable_pcr_interval == 0 or iter_num + 2 == self.iterations)
         )
         if apply_cable_pcr:
             wp.launch(

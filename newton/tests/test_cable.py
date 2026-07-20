@@ -751,6 +751,22 @@ def _cable_pcr_open_chain_topology_and_stability_impl(test: unittest.TestCase, d
     np.testing.assert_allclose(solver._rigid_cable_pcr_chain_tension.numpy(), 0.0, rtol=0.0, atol=1.0e-6)
     np.testing.assert_allclose(slack_state.body_q.numpy(), slack_q, rtol=0.0, atol=1.0e-7)
 
+    active_state = model.state()
+    active_q = active_state.body_q.numpy()
+    solver._rigid_cable_pcr_q_before.assign(active_q[packed_bodies])
+    active_q[rod_bodies[-1], 0] += 0.01
+    active_state.body_q.assign(active_q)
+    active_q_before_apply = active_q.copy()
+    solver._rigid_cable_pcr_chain_tension_threshold.zero_()
+    solver.body_hessian_ll.zero_()
+    solver._solve_rigid_cable_pcr(active_state.body_q, dt=1.0 / 120.0)
+    active_q_after = active_state.body_q.numpy()
+    test.assertGreater(
+        float(np.linalg.norm(active_q_after[packed_bodies, :3] - active_q_before_apply[packed_bodies, :3])),
+        1.0e-8,
+    )
+    solver._rigid_cable_pcr_chain_tension_threshold.fill_(1.0e30)
+
     for _ in range(8):
         default_solver.step(baseline_state0, baseline_state1, control, contacts=None, dt=1.0 / 120.0)
         solver.step(pcr_state0, pcr_state1, control, contacts=None, dt=1.0 / 120.0)
@@ -773,6 +789,106 @@ def _cable_pcr_open_chain_topology_and_stability_impl(test: unittest.TestCase, d
     loop_solver = newton.solvers.SolverVBD(loop_model, iterations=2, rigid_cable_pcr_enabled=True)
     test.assertEqual(loop_solver.rigid_cable_pcr_chain_count, 0)
     test.assertEqual(loop_solver.rigid_cable_pcr_node_count, 0)
+
+
+def _cable_pcr_thresholds_follow_world_and_model_updates_impl(test: unittest.TestCase, device):
+    """Cable PCR derives activation thresholds from current per-world dynamic weight."""
+    template = newton.ModelBuilder()
+    points, quaternions = _make_straight_cable_along_x(num_elements=4, segment_length=0.2, z_height=3.0)
+    template.add_rod(
+        positions=points,
+        quaternions=quaternions,
+        radius=0.05,
+        label="test_cable_pcr_world_threshold",
+        body_frame_origin="com",
+    )
+
+    builder = newton.ModelBuilder()
+    builder.add_world(template)
+    builder.add_world(template, xform=wp.transform(wp.vec3(0.0, 2.0, 0.0), wp.quat_identity()))
+    builder.color()
+    model = builder.finalize(device=device)
+    gravity = np.asarray(((0.0, 0.0, -2.0), (0.0, 0.0, -5.0)), dtype=np.float32)
+    model.set_gravity(gravity)
+
+    min_tension_ratio = 0.1
+    solver = newton.solvers.SolverVBD(
+        model,
+        iterations=3,
+        rigid_cable_pcr_enabled=True,
+        rigid_cable_pcr_min_tension_ratio=min_tension_ratio,
+    )
+    test.assertEqual(solver.rigid_cable_pcr_chain_count, 2)
+
+    def expected_thresholds():
+        body_mass = model.body_mass.numpy()
+        body_inv_mass = solver.body_inv_mass_effective.numpy()
+        body_world = model.body_world.numpy()
+        gravity_magnitude = np.linalg.norm(model.gravity.numpy(), axis=1)
+        packed_bodies = solver._rigid_cable_pcr_bodies.numpy()
+        chain_index = solver._rigid_cable_pcr_chain_index.numpy()
+        expected = np.zeros(solver.rigid_cable_pcr_chain_count, dtype=np.float64)
+        for node, body in enumerate(packed_bodies):
+            if body_inv_mass[body] <= 0.0:
+                continue
+            world = max(int(body_world[body]), 0)
+            expected[chain_index[node]] += float(body_mass[body]) * float(gravity_magnitude[world])
+        return min_tension_ratio * np.maximum(expected, 1.0e-6)
+
+    np.testing.assert_allclose(
+        solver._rigid_cable_pcr_chain_tension_threshold.numpy(), expected_thresholds(), rtol=1.0e-6, atol=1.0e-7
+    )
+
+    model.set_gravity(np.asarray(((0.0, 0.0, -3.0), (0.0, 0.0, -7.0)), dtype=np.float32))
+    solver.notify_model_changed(newton.ModelFlags.MODEL_PROPERTIES)
+    np.testing.assert_allclose(
+        solver._rigid_cable_pcr_chain_tension_threshold.numpy(), expected_thresholds(), rtol=1.0e-6, atol=1.0e-7
+    )
+
+    body_world = model.body_world.numpy()
+    body_mass = model.body_mass.numpy()
+    body_inv_mass = model.body_inv_mass.numpy()
+    world_one = body_world == 1
+    body_mass[world_one] *= 2.0
+    body_inv_mass[world_one] *= 0.5
+    model.body_mass.assign(body_mass)
+    model.body_inv_mass.assign(body_inv_mass)
+    solver.notify_model_changed(newton.ModelFlags.BODY_INERTIAL_PROPERTIES)
+    np.testing.assert_allclose(
+        solver._rigid_cable_pcr_chain_tension_threshold.numpy(), expected_thresholds(), rtol=1.0e-6, atol=1.0e-7
+    )
+
+    if device.is_cuda and wp.is_mempool_enabled(device):
+        with wp.ScopedCapture(device=device) as capture:
+            solver.notify_model_changed(newton.ModelFlags.BODY_INERTIAL_PROPERTIES)
+        wp.capture_launch(capture.graph)
+        np.testing.assert_allclose(
+            solver._rigid_cable_pcr_chain_tension_threshold.numpy(),
+            expected_thresholds(),
+            rtol=1.0e-6,
+            atol=1.0e-7,
+        )
+
+
+def _cable_pcr_leaves_a_final_smoothing_iteration_impl(test: unittest.TestCase, device):
+    """Every cable PCR correction must be followed by an ordinary VBD sweep."""
+    model, state0, state1, control, _rod_bodies = _build_cable_chain(device, num_links=4)
+    solver = newton.solvers.SolverVBD(
+        model,
+        iterations=3,
+        rigid_cable_pcr_enabled=True,
+        rigid_cable_pcr_interval=1,
+        rigid_cable_pcr_min_tension_ratio=0.0,
+    )
+    pcr_call_count = 0
+
+    def record_pcr_call(_body_q, _dt):
+        nonlocal pcr_call_count
+        pcr_call_count += 1
+
+    solver._solve_rigid_cable_pcr = record_pcr_call
+    solver.step(state0, state1, control, contacts=None, dt=1.0 / 120.0)
+    test.assertEqual(pcr_call_count, solver.iterations - 1)
 
 
 def _cable_bend_stiffness_impl(test: unittest.TestCase, device):
@@ -4346,6 +4462,18 @@ add_function_test(
     TestCable,
     "test_cable_pcr_open_chain_topology_and_stability",
     _cable_pcr_open_chain_topology_and_stability_impl,
+    devices=devices,
+)
+add_function_test(
+    TestCable,
+    "test_cable_pcr_thresholds_follow_world_and_model_updates",
+    _cable_pcr_thresholds_follow_world_and_model_updates_impl,
+    devices=devices,
+)
+add_function_test(
+    TestCable,
+    "test_cable_pcr_leaves_a_final_smoothing_iteration",
+    _cable_pcr_leaves_a_final_smoothing_iteration_impl,
     devices=devices,
 )
 add_function_test(
