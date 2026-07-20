@@ -60,7 +60,7 @@ GRIPPER_LATERAL_CORRECTION_MAX = 0.03
 GRIPPER_HEIGHT_CORRECTION_MAX = 0.06
 
 PULLEY_RADIUS = 0.045
-PULLEY_WRAP_CLEARANCE = 1.25 * CABLE_RADIUS
+PULLEY_WRAP_CLEARANCE = 1.5 * CABLE_RADIUS
 PULLEY_WRAP_RADIUS = PULLEY_RADIUS + PULLEY_WRAP_CLEARANCE
 PULLEY_FIXED_Z = 1.10
 PULLEY_MOVING_Z = 0.72
@@ -862,6 +862,8 @@ class Example:
                     rigid_body_contact_buffer_size=512,
                     rigid_contact_hard=False,
                     rigid_contact_history=False,
+                    rigid_articulation_solve="block_sparse_joints",
+                    rigid_articulation_relaxation=0.25,
                 ),
                 bodies=self.vbd_bodies,
                 joints=self.vbd_joints,
