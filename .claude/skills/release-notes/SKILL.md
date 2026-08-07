@@ -23,8 +23,18 @@ what users should know. Do not reproduce the full changelog; link to it.
    - RCs: state that this is a release candidate and what needs validation.
      If drafting final-release text from an RC tag or release branch, do not
      mention the RC; use the RC only as the temporary source of truth.
-2. Read the matching `CHANGELOG.md` section from the release tag or release
-   branch. Do not rely on `main` unless the release is actually cut from `main`.
+2. Choose changelog source material from the authoritative release ref:
+   - After the Towncrier build or tagging, read the matching dated
+     `CHANGELOG.md` section from the release tag or release branch.
+   - Before the build, check out the release branch, validate its pending
+     fragments, and render a non-mutating preview:
+     ```bash
+     uvx --from towncrier==25.8.0 towncrier build --draft \
+       --version X.Y.Z --date YYYY-MM-DD
+     ```
+     Draft from the preview and legacy `[Unreleased]` entries during the first
+     Towncrier transition. Do not run a mutating build merely to draft notes.
+   Do not rely on `main` unless the release is actually cut from `main`.
 3. Determine the previous release tag:
    - Patch release `X.Y.Z`, `Z > 0`: use the highest earlier `vX.Y.<Z'>` tag.
    - Feature release `X.Y.0`: use the highest `vX.<Y-1>.*` tag. If `Y == 0`,
@@ -51,6 +61,9 @@ what users should know. Do not reproduce the full changelog; link to it.
    consumer-relevant items. Omit CI, workflow, README layout, release-link
    pinning, and other internal/docs polish unless the user explicitly asks or it
    affects library users.
+8. Keep a review-ready release-branch draft. After tagging, refresh it against
+   the final tag and inspect the workflow-created draft GitHub Release. Publish
+   only after verifying the final artifact and links per `docs/guide/release.rst`.
 
 ## Linking Rules
 
@@ -105,6 +118,7 @@ what users should know. Do not reproduce the full changelog; link to it.
 - For patch releases, say whether the release is intended to be API-compatible
   with the previous patch/minor when that is true.
 - Avoid em dashes in rendered prose.
+- Keep raw Markdown soft-wrapped: use one physical line per paragraph and list item; let viewers wrap it to their window width.
 
 ## Dependency Updates
 
