@@ -862,6 +862,8 @@ class Example:
                     rigid_body_contact_buffer_size=512,
                     rigid_contact_hard=False,
                     rigid_contact_history=False,
+                    rigid_compliant_alm=True,
+                    rigid_joint_global_iterations=1,
                 ),
                 bodies=self.vbd_bodies,
                 joints=self.vbd_joints,
