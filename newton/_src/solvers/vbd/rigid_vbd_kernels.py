@@ -2220,6 +2220,65 @@ def _eval_soft_ef_contact(
     return force, hessian, bx
 
 
+@wp.kernel
+def report_soft_contact_forces(
+    dt: float,
+    rigid_contact_max: int,
+    soft_contact_count: wp.array[int],
+    soft_contact_indices: wp.array[wp.vec3i],
+    soft_contact_barycentric: wp.array[wp.vec3],
+    particle_q: wp.array[wp.vec3],
+    particle_q_prev: wp.array[wp.vec3],
+    particle_radius: wp.array[float],
+    contact_penalty_k: wp.array[float],
+    contact_material_kd: wp.array[float],
+    contact_material_mu: wp.array[float],
+    friction_epsilon: float,
+    use_log_barrier: bool,
+    shape_body: wp.array[int],
+    body_q: wp.array[wp.transform],
+    body_q_prev: wp.array[wp.transform],
+    body_qd: wp.array[wp.spatial_vector],
+    body_com: wp.array[wp.vec3],
+    soft_contact_shape: wp.array[int],
+    soft_contact_body_pos: wp.array[wp.vec3],
+    soft_contact_body_vel: wp.array[wp.vec3],
+    soft_contact_normal: wp.array[wp.vec3],
+    shape_margin: wp.array[float],
+    out_force: wp.array[wp.spatial_vector],
+):
+    """Report the force on each soft feature using the particle solve's contact law."""
+    contact_idx = wp.tid()
+    if contact_idx >= soft_contact_count[0]:
+        return
+
+    force, _contact_hessian, _body_point = _eval_soft_ef_contact(
+        contact_idx,
+        soft_contact_indices[contact_idx],
+        soft_contact_barycentric[contact_idx],
+        particle_q,
+        particle_q_prev,
+        particle_radius,
+        contact_penalty_k[contact_idx],
+        contact_material_kd[contact_idx],
+        contact_material_mu[contact_idx],
+        friction_epsilon,
+        shape_body,
+        body_q,
+        body_q_prev,
+        body_qd,
+        body_com,
+        soft_contact_shape,
+        soft_contact_body_pos,
+        soft_contact_body_vel,
+        soft_contact_normal,
+        shape_margin,
+        dt,
+        use_log_barrier,
+    )
+    out_force[rigid_contact_max + contact_idx] = wp.spatial_vector(force, wp.vec3(0.0))
+
+
 @wp.func
 def evaluate_body_particle_contact(
     particle_index: int,
@@ -5395,6 +5454,7 @@ def create_compute_rigid_contact_forces():
         out_point0_world: wp.array[wp.vec3],
         out_point1_world: wp.array[wp.vec3],
         out_force_on_body1: wp.array[wp.vec3],
+        out_contact_force: wp.array[wp.spatial_vector],
     ):
         """Compute per-contact forces in world space."""
         contact_idx = wp.tid()
@@ -5407,6 +5467,8 @@ def create_compute_rigid_contact_forces():
             out_point0_world[contact_idx] = wp.vec3(0.0)
             out_point1_world[contact_idx] = wp.vec3(0.0)
             out_force_on_body1[contact_idx] = wp.vec3(0.0)
+            if out_contact_force:
+                out_contact_force[contact_idx] = wp.spatial_vector(wp.vec3(0.0), wp.vec3(0.0))
             return
 
         s0 = rigid_contact_shape0[contact_idx]
@@ -5417,6 +5479,8 @@ def create_compute_rigid_contact_forces():
             out_point0_world[contact_idx] = wp.vec3(0.0)
             out_point1_world[contact_idx] = wp.vec3(0.0)
             out_force_on_body1[contact_idx] = wp.vec3(0.0)
+            if out_contact_force:
+                out_contact_force[contact_idx] = wp.spatial_vector(wp.vec3(0.0), wp.vec3(0.0))
             return
 
         b0 = shape_body[s0]
@@ -5470,6 +5534,8 @@ def create_compute_rigid_contact_forces():
         f_n_check = normal_primal_k * C_eff + lambda_n_eff
         if (C_n <= _SMALL_LENGTH_EPS or f_n_check <= 0.0) and lam_n <= 0.0:
             out_force_on_body1[contact_idx] = wp.vec3(0.0)
+            if out_contact_force:
+                out_contact_force[contact_idx] = wp.spatial_vector(wp.vec3(0.0), wp.vec3(0.0))
             return
 
         contact_kd = contact_material_kd[contact_idx]
@@ -5480,8 +5546,8 @@ def create_compute_rigid_contact_forces():
             surface_velocity = rigid_contact_surface_velocity[contact_idx]
 
         (
-            _force_0,
-            _torque_0,
+            force_0,
+            torque_0,
             _h_ll_0,
             _h_al_0,
             _h_aa_0,
@@ -5517,6 +5583,8 @@ def create_compute_rigid_contact_forces():
         )
 
         out_force_on_body1[contact_idx] = force_1
+        if out_contact_force:
+            out_contact_force[contact_idx] = wp.spatial_vector(force_0, torque_0)
 
     # ``module="unique"`` kernels do not inherit this file's module options.
     wp.set_module_options({"enable_backward": False}, module=compute_rigid_contact_forces.module)

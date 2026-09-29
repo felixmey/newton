@@ -429,7 +429,8 @@ class Contacts:
             # Extended contact attributes (optional, allocated on demand)
             self.force: wp.array | None = None
             """Contact forces (spatial) [N, N·m], shape (rigid_contact_max + soft_contact_max,), dtype :class:`spatial_vector`.
-            Force and torque exerted on body0 by body1, referenced to the center of mass (COM) of body0, and in world frame, where body0 and body1 are the bodies of shape0 and shape1.
+            For rigid contacts, force and torque exerted on body0 by body1, referenced to the center of mass (COM) of body0, in world frame.
+            For soft contacts reported by SolverVBD, the linear component is the world-frame force on the soft feature from the contacted shape; the torque component is zero.
             First three entries: linear force [N]; last three entries: torque (moment) [N·m].
             When both rigid and soft contacts are present, soft contact forces follow rigid contact forces.
 

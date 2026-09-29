@@ -76,6 +76,7 @@ from .rigid_vbd_kernels import (
     init_rod_rest_bend_twist,
     refresh_body_structural_k,
     refresh_joint_material_params,
+    report_soft_contact_forces,
     reset_rigid_state,
     snapshot_body_body_contact_history,
     solve_rigid_body,
@@ -866,6 +867,10 @@ class SolverVBD(SolverBase, CouplingInterface):
         # participate in particle-rigid interaction on the particle side.
         self.integrate_with_external_rigid_solver = integrate_with_external_rigid_solver
         self._integrates_rigid_bodies = integrates_rigid_bodies
+        self._force_contacts: Contacts | None = None
+        self._force_state: State | None = None
+        self._force_dt = 0.0
+        self._force_body_q_prev = wp.empty(model.body_count, dtype=wp.transform, device=self.device)
 
         # Initialize particle system
         self._init_particle_system(
@@ -2440,6 +2445,18 @@ class SolverVBD(SolverBase, CouplingInterface):
 
         # Snapshot solved rigid contact state for next-frame warm-start.
         self._snapshot_rigid_contact_history(contacts)
+        if contacts is not None and contacts.force is not None:
+            body_q_prev = (
+                state_in.body_q if self.integrate_with_external_rigid_solver else getattr(self, "body_q_prev", None)
+            )
+            if self.model.body_count > 0 and body_q_prev is not None:
+                wp.copy(self._force_body_q_prev, body_q_prev)
+            self._force_contacts = contacts
+            self._force_state = state_out
+            self._force_dt = float(dt)
+        else:
+            self._force_contacts = None
+            self._force_state = None
         self._finalize_rigid_bodies(state_in, state_out, dt)
         self._finalize_particles(state_out, dt)
 
@@ -2528,6 +2545,8 @@ class SolverVBD(SolverBase, CouplingInterface):
         """
         if state is None:
             raise ValueError("'state' argument is required.")
+        self._force_contacts = None
+        self._force_state = None
         model = self.model
         world_mask = self._normalize_reset_world_mask(world_mask)
 
@@ -4090,6 +4109,74 @@ class SolverVBD(SolverBase, CouplingInterface):
                 device=self.device,
             )
 
+    @override
+    def update_contacts(self, contacts: Contacts, state: State | None = None) -> None:
+        """Populate extended contact forces from the preceding VBD step.
+
+        Rigid rows contain the world-frame wrench on shape 0 about its body's
+        center of mass. Soft rows contain the world-frame force on the soft
+        feature; their torque component is zero because soft features have no
+        rigid-body center of mass. Inactive rows are cleared.
+
+        Args:
+            contacts: The contacts buffer passed to the preceding :meth:`step`,
+                allocated with the ``"force"`` extended attribute.
+            state: Output state of that step. Defaults to the state passed to :meth:`step`.
+
+        Raises:
+            ValueError: If the required force buffer, step, or output state is missing.
+        """
+        self._apply_module_options()
+        if contacts.force is None:
+            raise ValueError(
+                "contacts.force is not allocated. Request the 'force' contact attribute before creating contacts."
+            )
+        if self._force_contacts is not contacts:
+            raise ValueError("Call step() with these contacts before update_contacts().")
+        if state is None:
+            state = self._force_state
+        if state is None:
+            raise ValueError("VBD contact force reporting requires the output state from step().")
+
+        contacts.force.zero_()
+        body_q = state.body_q if state.body_q is not None else self._empty_body_q
+        body_q_prev = self._force_body_q_prev if self.model.body_count > 0 else None
+        if self._integrates_rigid_bodies and contacts.rigid_contact_max > 0:
+            self.collect_rigid_contact_forces(body_q, body_q_prev, contacts, self._force_dt)
+
+        if self.model.particle_count > 0 and contacts.soft_contact_max > 0:
+            wp.launch(
+                kernel=report_soft_contact_forces,
+                dim=contacts.soft_contact_max,
+                inputs=[
+                    self._force_dt,
+                    contacts.rigid_contact_max,
+                    contacts.soft_contact_count,
+                    contacts.soft_contact_indices,
+                    contacts.soft_contact_barycentric,
+                    state.particle_q,
+                    self.particle_q_prev,
+                    self.model.particle_radius,
+                    self.body_particle_contact_penalty_k,
+                    self.body_particle_contact_material_kd,
+                    self.body_particle_contact_material_mu,
+                    self.friction_epsilon,
+                    self.rigid_soft_contact_use_log_barrier,
+                    self.model.shape_body,
+                    body_q,
+                    body_q_prev,
+                    state.body_qd,
+                    self.model.body_com,
+                    contacts.soft_contact_shape,
+                    contacts.soft_contact_body_pos,
+                    contacts.soft_contact_body_vel,
+                    contacts.soft_contact_normal,
+                    self.model.shape_margin,
+                ],
+                outputs=[contacts.force],
+                device=self.device,
+            )
+
     def collect_rigid_contact_forces(
         self,
         body_q: wp.array[wp.transform],
@@ -4228,6 +4315,7 @@ class SolverVBD(SolverBase, CouplingInterface):
                 self._rigid_contact_point0_world,
                 self._rigid_contact_point1_world,
                 contacts.rigid_contact_force,
+                contacts.force,
             ],
             device=self.device,
         )

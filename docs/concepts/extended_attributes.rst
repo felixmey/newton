@@ -136,3 +136,8 @@ Notes
   :class:`~newton.solvers.SolverKamino` populates ``body_qdd`` as the discrete
   step-average acceleration ``(body_qd_out - body_qd_in) / dt``; across an
   impact, this includes the velocity impulse divided by ``dt``.
+  :class:`~newton.solvers.SolverVBD` populates ``force`` for rigid and soft
+  contacts when :meth:`~newton.solvers.SolverVBD.update_contacts` is called
+  after a step. Soft rows follow the rigid-contact
+  capacity in the buffer and contain the force on the soft feature; their
+  torque component is zero.

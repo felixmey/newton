@@ -2750,7 +2750,7 @@ def _body_body_contact_damping_ignores_penalty_ramp(test, device):
                 0,
                 0.01,
             ],
-            outputs=[body0, body1, point0_world, point1_world, force_on_body1],
+            outputs=[body0, body1, point0_world, point1_world, force_on_body1, None],
             device=device,
         )
 
@@ -4401,6 +4401,7 @@ def _collect_rigid_contact_forces_reports_surface_points(test, device):
     body = builder.add_body(xform=wp.transform(p=wp.vec3(0.0, 0.0, 0.95 * radius), q=wp.quat_identity()))
     builder.add_shape_sphere(body, radius=radius)
     builder.color()
+    builder.request_contact_attributes("force")
 
     with wp.ScopedDevice(device):
         model = builder.finalize()
@@ -4419,6 +4420,7 @@ def _collect_rigid_contact_forces_reports_surface_points(test, device):
         c_b0, c_b1, c_p0w, c_p1w, _c_force, c_count = solver.collect_rigid_contact_forces(
             state_1.body_q, body_q_prev_snapshot, contacts, 1.0e-3
         )
+        solver.update_contacts(contacts, state_1)
 
         count = int(c_count.numpy()[0])
         body_q_np = state_1.body_q.numpy()
@@ -4430,6 +4432,8 @@ def _collect_rigid_contact_forces_reports_surface_points(test, device):
         point1_np = contacts.rigid_contact_point1.numpy()
         offset0_np = contacts.rigid_contact_offset0.numpy()
         offset1_np = contacts.rigid_contact_offset1.numpy()
+        force_on_body1 = _c_force.numpy()
+        force_on_body0 = contacts.force.numpy()
 
     test.assertGreater(count, 0, msg="Expected at least one sphere-ground rigid contact")
     max_offset = np.max(
@@ -4450,6 +4454,53 @@ def _collect_rigid_contact_forces_reports_surface_points(test, device):
 
     np.testing.assert_allclose(reported0_np[:count], expected0, atol=1.0e-5)
     np.testing.assert_allclose(reported1_np[:count], expected1, atol=1.0e-5)
+    np.testing.assert_allclose(force_on_body0[:count, :3], -force_on_body1[:count], atol=1.0e-5)
+    test.assertTrue(np.any(np.linalg.norm(force_on_body0[:count, :3], axis=1) > 0.0))
+    np.testing.assert_allclose(force_on_body0[count:], 0.0, atol=1.0e-5)
+
+
+def _vbd_reports_soft_contact_forces(test, device):
+    """Report particle and face contact forces in the extended contact buffer."""
+    builder = newton.ModelBuilder()
+    builder.add_shape_box(body=-1, hx=1.0, hy=1.0, hz=1.0)
+    p0 = builder.add_particle(wp.vec3(0.0, 0.0, 0.0), wp.vec3(0.0), 0.1, radius=0.0)
+    p1 = builder.add_particle(wp.vec3(1.0, 0.0, 0.0), wp.vec3(0.0), 0.1, radius=0.0)
+    p2 = builder.add_particle(wp.vec3(0.0, 1.0, 0.0), wp.vec3(0.0), 0.1, radius=0.0)
+    builder.add_triangle(p0, p1, p2)
+    builder.color()
+
+    with wp.ScopedDevice(device):
+        model = builder.finalize()
+        model.set_gravity((0.0, 0.0, 0.0))
+        contacts = newton.Contacts(2, 3, requested_attributes={"force"}, device=device)
+        contacts.soft_contact_count.assign([2])
+        _set_slot(contacts.soft_contact_indices, 0, [p0, -1, -1])
+        _set_slot(contacts.soft_contact_barycentric, 0, [1.0, 0.0, 0.0])
+        _set_slot(contacts.soft_contact_indices, 1, [p0, p1, p2])
+        _set_slot(contacts.soft_contact_barycentric, 1, [0.6, 0.3, 0.1])
+        for i in range(2):
+            _set_slot(contacts.soft_contact_shape, i, 0)
+            _set_slot(contacts.soft_contact_body_pos, i, [0.0, 0.0, 0.05])
+            _set_slot(contacts.soft_contact_normal, i, [0.0, 0.0, 1.0])
+
+        solver = newton.solvers.SolverVBD(model, iterations=0)
+        state_in, state_out = model.state(), model.state()
+        solver.step(state_in, state_out, None, contacts, 1.0e-3)
+        solver.update_contacts(contacts)
+        force = contacts.force.numpy()
+        contact_ke = solver.body_particle_contact_penalty_k.numpy()
+
+        np.testing.assert_allclose(force[:2], 0.0, atol=1.0e-5)
+        test.assertGreater(force[2, 2], 0.0)
+        test.assertGreater(force[3, 2], 0.0)
+        np.testing.assert_allclose(force[2:4, 2], 0.05 * contact_ke[:2], rtol=1.0e-5)
+        np.testing.assert_allclose(force[2:4, :2], 0.0, atol=1.0e-5)
+        np.testing.assert_allclose(force[:, 3:], 0.0, atol=1.0e-5)
+        np.testing.assert_allclose(force[4], 0.0, atol=1.0e-5)
+
+        contacts.soft_contact_count.assign([0])
+        solver.update_contacts(contacts, state_out)
+        np.testing.assert_array_equal(contacts.force.numpy(), 0.0)
 
 
 def _body_body_contact_lists_skip_static_kinematic(test, device):
@@ -5289,6 +5340,7 @@ add_function_test(
     _collect_rigid_contact_forces_reports_surface_points,
     devices=devices,
 )
+add_function_test(TestSolverVBD, "test_reports_soft_contact_forces", _vbd_reports_soft_contact_forces, devices=devices)
 add_function_test(
     TestSolverVBD,
     "test_soft_contact_presize_is_world_aware",
